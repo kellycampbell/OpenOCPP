@@ -1228,9 +1228,9 @@ namespace chargelab {
         }
 
         void runUnconditionally() override {
-            reportHeapUsage();
-            reportDiskUsage();
-            reportCertificateMetrics();
+            // reportHeapUsage();
+            // reportDiskUsage();
+            // reportCertificateMetrics();
 
             if (!initialised_) {
                 initializePlatform();
@@ -1702,58 +1702,23 @@ namespace chargelab {
     private:
         void initializePlatform() {
             CHARGELAB_LOG_MESSAGE(info) << "Initializing platform...";
-/*
-            ESP_ERROR_CHECK(esp_netif_init());
-            ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-            st_netif_ = esp_netif_create_default_wifi_sta();
-            ap_netif_ = esp_netif_create_default_wifi_ap();
-            assert(st_netif_);
-
-            wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-            ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-            auto const client_ssid = settings_->WifiSSID.transitionCurrentValue();
-            auto const client_password = settings_->WifiPassword.transitionCurrentValue();
-
+            // WiFi is managed by the main firmware; register event handlers to track state changes.
             ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &EventHandler, this, nullptr));
             ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &EventHandler, this, nullptr));
-            //ESP_ERROR_CHECK(esp_wifi_set_mode(client_ssid.empty() ? WIFI_MODE_AP : WIFI_MODE_APSTA));
-            ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+            wifi_sta_enabled_ = true;
 
-            ESP_ERROR_CHECK(esp_wifi_start());
-
-            if (!client_ssid.empty()) {
-                wifi_config_t station_config {};
-                strlcpy((char *) station_config.sta.ssid, client_ssid.c_str(), sizeof(station_config.sta.ssid));
-                strlcpy((char *) station_config.sta.password, client_password.c_str(), sizeof(station_config.sta.password));
-
-                station_config.sta.channel = 0;
-                station_config.sta.pmf_cfg.capable = true;
-                station_config.sta.pmf_cfg.required = false;
-
-                ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &station_config));
-                wifi_sta_enabled_ = true;
+            // WiFi may already be started/connected before we registered handlers — check current state.
+            started_ = true;
+            esp_netif_t* sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+            if (sta_netif != nullptr) {
+                esp_netif_ip_info_t ip_info{};
+                if (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+                    CHARGELAB_LOG_MESSAGE(info) << "WiFi already connected at platform init";
+                    connected_ = true;
+                }
             }
-
-            auto const ap_ssid = settings_->ChargerAccessPointSSID.getValue();
-            auto const ap_password = settings_->WifiPassword.transitionCurrentValue();
-
-            wifi_config_t ap_config {};
-            strlcpy((char *) ap_config.ap.ssid, ap_ssid.c_str(), sizeof(ap_config.ap.ssid));
-            strlcpy((char *) ap_config.sta.password, ap_password.c_str(), sizeof(ap_config.sta.password));
-            ap_config.ap.authmode = ap_password.empty() ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
-            ap_config.ap.ssid_hidden = !client_ssid.empty() && settings_->WifiHideStationAccessPointAfterSetup.getValue() ? 1 : 0;
-
-            // TODO: Check what happens if this is exceeded; does the old connection get dropped or does the new
-            //  connection get refused?
-            ap_config.ap.max_connection = 1;
-
-            ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
-*/
-                wifi_sta_enabled_ = true;
-
-}
+        }
 
         void checkNetworkConnection() {
             if (!wifi_sta_enabled_)

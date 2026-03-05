@@ -210,7 +210,7 @@ namespace chargelab {
         }
 
         void runStep(ocpp2_0::OcppRemote& remote) override {
-            reportJournalCapacity();
+            // reportJournalCapacity();
 
             if (pending_get_charging_profiles_request_.has_value())
                 sendChargingProfilesReport(remote);

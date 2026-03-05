@@ -9,7 +9,7 @@
 namespace chargelab::logging {
     namespace {
         std::atomic<LogLevel> gLogLevel {LogLevel::trace};
-        constexpr char const* kTag = "main";
+        constexpr char const* kTag = "OCPP";
 
         std::recursive_mutex gMutex {};
         std::vector<std::shared_ptr<LoggingListenerFunction>> gListeners {};

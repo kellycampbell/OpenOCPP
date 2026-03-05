@@ -120,7 +120,7 @@ namespace chargelab {
 
     private:
         void runUnconditionally() override {
-            reportQueueSize();
+            // reportQueueSize();
             uploadLogs();
             flushLogMessages();
         }
