@@ -149,7 +149,7 @@ namespace chargelab {
             auto const millis = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
             return static_cast<chargelab::SteadyPointMillis>(millis);
         }
-        
+
         inline int getDelaySeconds(Settings const& settings, int failed_connection_attempts) {
             auto delay_seconds = settings.NetworkConnectionRetryBackOffWaitMinimum.getValue();
             if (failed_connection_attempts > 0) {
@@ -1095,6 +1095,8 @@ namespace chargelab {
                 esp_spiffs_format(spiffs_conf_.partition_label);
             }
 
+            CHARGELAB_LOG_MESSAGE(info) << "Loading settings";
+
             auto settingsPath = std::string(kSpiffsPathPrefix) + "/" + kSettingsFile;
             auto settingsStorage = std::make_shared<StorageFile>(std::move(settingsPath));
             settings_ = std::make_shared<Settings>(std::move(settingsStorage));
@@ -1700,6 +1702,7 @@ namespace chargelab {
     private:
         void initializePlatform() {
             CHARGELAB_LOG_MESSAGE(info) << "Initializing platform...";
+/*
             ESP_ERROR_CHECK(esp_netif_init());
             ESP_ERROR_CHECK(esp_event_loop_create_default());
 
@@ -1747,7 +1750,10 @@ namespace chargelab {
             ap_config.ap.max_connection = 1;
 
             ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
-        }
+*/
+                wifi_sta_enabled_ = true;
+
+}
 
         void checkNetworkConnection() {
             if (!wifi_sta_enabled_)

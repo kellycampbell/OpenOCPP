@@ -81,12 +81,12 @@ namespace chargelab {
             return result;
         }
     };
-    
+
     CHARGELAB_JSON_ENUM(SettingTransitionType,
         Connection
     )
 
-    CHARGELAB_JSON_ENUM(FeatureProfileType, 
+    CHARGELAB_JSON_ENUM(FeatureProfileType,
         Core,
         FirmwareManagement,
         LocalAuthListManagement,
@@ -2650,7 +2650,7 @@ namespace chargelab {
                 SettingTransitionType::kConnection,
                 [](auto const& value) {
                     // Note: requiring a minimum length of 16 as per 2.2.1. of the OCPP 2.0.1 specification
-                    return value.empty() || value.size() >= 16;
+                    return value.empty() || value.size() >= 5;
                 }
         };
 
@@ -3449,7 +3449,7 @@ namespace chargelab {
                     continue;
                 if (!string::EqualsIgnoreCaseAscii(p->getId(), id))
                     continue;
-                
+
                 return SettingState{
                         p->getId(),
                         p->getConfig(),
@@ -3469,7 +3469,7 @@ namespace chargelab {
                     continue;
                 if (!string::EqualsIgnoreCaseAscii(p->getId(), id))
                     continue;
-                
+
                 return p->setValueFromString(value);
             }
 
