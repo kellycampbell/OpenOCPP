@@ -74,7 +74,7 @@ namespace chargelab {
                 return Result::kFailed;
             }
 
-            update_size_ += size;
+            update_offset_ += size;
             return Result::kSucceeded;
         }
 
