@@ -202,6 +202,18 @@ namespace chargelab {
                 processVehicleConnectedStateChanged(entry.first, status->vehicle_connected);
             }
 
+            // Process charging_enabled state changes for PowerPathClosed TxStartPoint/TxStopPoint
+            for (auto const& entry : metadata) {
+                auto const status = station_->pollConnectorStatus(entry.first);
+                if (!status.has_value())
+                    continue;
+                if (status->charging_enabled == last_charging_enabled_state_[entry.first])
+                    continue;
+
+                last_charging_enabled_state_[entry.first] = status->charging_enabled;
+                processChargingEnabledStateChanged(entry.first, status->charging_enabled);
+            }
+
             // First process any pending start requests for a specific connector
             for (auto& entry : pending_start_req_) {
                 if (entry.first.has_value() && entry.first->connectorId.has_value())
@@ -1275,6 +1287,65 @@ namespace chargelab {
             }
         }
 
+        void processChargingEnabledStateChanged(ocpp2_0::EVSEType const& evse, bool charging_enabled) {
+            assert(evse.connectorId.has_value());
+            CHARGELAB_LOG_MESSAGE(info) << "Charging enabled state changed (" << evse << "): charging_enabled=" << charging_enabled;
+
+            auto const& start_points = getStartPoints();
+            auto const& stop_points = getStopPoints();
+
+            if (charging_enabled) {
+                // PowerPathClosed TxStartPoint: start a new transaction when the power path closes,
+                // but only if the vehicle is connected and no transaction is already active on this EVSE.
+                if (!set::contains(start_points, ocpp2_0::TxStartPointValues::kPowerPathClosed))
+                    return;
+                if (active_transactions_[evse].has_value())
+                    return;
+
+                auto const status = station_->pollConnectorStatus(evse);
+                if (!status.has_value() || !status->vehicle_connected)
+                    return;
+
+                auto const now = floorToSecond(platform_->systemClockNow());
+                auto const meter_values = getMeterValues(
+                        evse,
+                        ocpp2_0::ReadingContextEnumType::kTransaction_Begin,
+                        settings_->SampledDataTxStartedMeasurands.getValue(),
+                        now
+                );
+                auto const& result = startTransaction(
+                        evse,
+                        std::nullopt,
+                        std::nullopt,
+                        ocpp2_0::TriggerReasonEnumType::kChargingStateChanged,
+                        false,
+                        now,
+                        meter_values.original,
+                        meter_values.filtered
+                );
+                CHARGELAB_LOG_MESSAGE(info) << "Started new transaction (PowerPathClosed) - transaction ID: " << result.transaction_id;
+            } else {
+                // PowerPathClosed TxStopPoint: stop the active transaction when the power path opens,
+                // but only if the vehicle remains connected (disconnect is handled by processVehicleConnectedStateChanged).
+                if (!set::contains(stop_points, ocpp2_0::TxStopPointValues::kPowerPathClosed))
+                    return;
+                if (!active_transactions_[evse].has_value())
+                    return;
+
+                auto const status = station_->pollConnectorStatus(evse);
+                if (!status.has_value() || !status->vehicle_connected)
+                    return;
+
+                CHARGELAB_LOG_MESSAGE(info) << "Stopping transaction (PowerPathClosed opened) - transaction ID: " << active_transactions_[evse]->transaction_id;
+                stopTransaction(
+                        evse,
+                        ocpp2_0::TriggerReasonEnumType::kChargingStateChanged,
+                        ocpp2_0::ReasonEnumType::kStoppedByEV,
+                        std::nullopt
+                );
+            }
+        }
+
         void processPendingStartRequest(ocpp2_0::OcppRemote& remote, std::optional<transaction_module2_0::PendingStartRequest>& pending) {
             if (!pending.has_value())
                 return;
@@ -1723,6 +1794,7 @@ namespace chargelab {
         std::atomic<int64_t> unique_index_;
         std::map<std::optional<ocpp2_0::EVSEType>, std::optional<transaction_module2_0::PendingStartRequest>> pending_start_req_;
         std::map<ocpp2_0::EVSEType, bool> last_plugged_in_state_;
+        std::map<ocpp2_0::EVSEType, bool> last_charging_enabled_state_;
         std::optional<ocpp2_0::IdTokenType> last_rfid_tag_id_ = std::nullopt;
         SystemTimeMillis last_non_transaction_meter_value_trigger_ = static_cast<SystemTimeMillis> (0);
 
