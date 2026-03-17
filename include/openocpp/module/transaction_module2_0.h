@@ -202,7 +202,7 @@ namespace chargelab {
                 processVehicleConnectedStateChanged(entry.first, status->vehicle_connected);
             }
 
-            // Process charging_enabled state changes for PowerPathClosed TxStartPoint/TxStopPoint
+            // Process charging_enabled state changes for EnergyTransfer TxStartPoint/TxStopPoint
             for (auto const& entry : metadata) {
                 auto const status = station_->pollConnectorStatus(entry.first);
                 if (!status.has_value())
@@ -1295,9 +1295,9 @@ namespace chargelab {
             auto const& stop_points = getStopPoints();
 
             if (charging_enabled) {
-                // PowerPathClosed TxStartPoint: start a new transaction when the power path closes,
+                // EnergyTransfer TxStartPoint: start a new transaction when energy starts,
                 // but only if the vehicle is connected and no transaction is already active on this EVSE.
-                if (!set::contains(start_points, ocpp2_0::TxStartPointValues::kPowerPathClosed))
+                if (!set::contains(start_points, ocpp2_0::TxStartPointValues::kEnergyTransfer))
                     return;
                 if (active_transactions_[evse].has_value())
                     return;
@@ -1323,11 +1323,11 @@ namespace chargelab {
                         meter_values.original,
                         meter_values.filtered
                 );
-                CHARGELAB_LOG_MESSAGE(info) << "Started new transaction (PowerPathClosed) - transaction ID: " << result.transaction_id;
+                CHARGELAB_LOG_MESSAGE(info) << "Started new transaction (EnergyTransfer) - transaction ID: " << result.transaction_id;
             } else {
-                // PowerPathClosed TxStopPoint: stop the active transaction when the power path opens,
+                // EnergyTransfer TxStopPoint: stop the active transaction when the EV stops charging,
                 // but only if the vehicle remains connected (disconnect is handled by processVehicleConnectedStateChanged).
-                if (!set::contains(stop_points, ocpp2_0::TxStopPointValues::kPowerPathClosed))
+                if (!set::contains(stop_points, ocpp2_0::TxStopPointValues::kEnergyTransfer))
                     return;
                 if (!active_transactions_[evse].has_value())
                     return;
@@ -1336,7 +1336,7 @@ namespace chargelab {
                 if (!status.has_value() || !status->vehicle_connected)
                     return;
 
-                CHARGELAB_LOG_MESSAGE(info) << "Stopping transaction (PowerPathClosed opened) - transaction ID: " << active_transactions_[evse]->transaction_id;
+                CHARGELAB_LOG_MESSAGE(info) << "Stopping transaction (EnergyTransfer stopped) - transaction ID: " << active_transactions_[evse]->transaction_id;
                 stopTransaction(
                         evse,
                         ocpp2_0::TriggerReasonEnumType::kChargingStateChanged,
