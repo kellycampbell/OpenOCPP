@@ -243,7 +243,7 @@ namespace chargelab {
                 if (ret != Z_OK && ret != Z_STREAM_END) {
                     if (!ignore_read_errors_) {
                         CHARGELAB_LOG_MESSAGE(warning) << "inflate failed with error code " << ret << ": "
-                                                       << (char const *) stream_.msg;
+                                                       << (stream_.msg != nullptr ? stream_.msg : "(null)");
                     }
 
                     return nullptr;
