@@ -25,6 +25,19 @@ gzip_files()
 
 list(APPEND SOURCES "main.cc")
 list(APPEND SOURCES "../../include/openocpp/implementation/logging_esp.cc")
+list(APPEND SOURCES "../../src/module/boot_notification_module.cpp")
+list(APPEND SOURCES "../../src/module/configuration_module.cpp")
+list(APPEND SOURCES "../../src/module/connector_status_module.cpp")
+list(APPEND SOURCES "../../src/module/fallback_module.cpp")
+list(APPEND SOURCES "../../src/module/get_logs_module.cpp")
+list(APPEND SOURCES "../../src/module/heartbeat_module.cpp")
+list(APPEND SOURCES "../../src/module/local_limits_module.cpp")
+list(APPEND SOURCES "../../src/module/pending_messages_module.cpp")
+list(APPEND SOURCES "../../src/module/power_management_module1_6.cpp")
+list(APPEND SOURCES "../../src/module/power_management_module2_0.cpp")
+list(APPEND SOURCES "../../src/module/reset_module.cpp")
+list(APPEND SOURCES "../../src/module/transaction_module1_6.cpp")
+list(APPEND SOURCES "../../src/module/transaction_module2_0.cpp")
 
 idf_component_register(
         SRCS ${SOURCES}

@@ -1,0 +1,630 @@
+#include "openocpp/module/transaction_module1_6.h"
+
+namespace chargelab {
+    namespace {
+        constexpr int kPriorityStartTransaction = 0;
+        constexpr int kPriorityStopTransaction = 0;
+        constexpr int kPriorityMeterValue = 5;
+    }
+
+    TransactionModule1_6::TransactionModule1_6(
+            std::shared_ptr<PlatformInterface> const& platform,
+            std::shared_ptr<BootNotificationModule> boot_notification_module,
+            std::shared_ptr<PowerManagementModule1_6> power_management_module,
+            std::shared_ptr<PendingMessagesModule> pending_messages_module,
+            std::shared_ptr<ConnectorStatusModule> connector_status_module,
+            std::shared_ptr<StationInterface> station,
+            std::shared_ptr<TransactionListener1_6> transaction_listener
+    )
+        : platform_(platform),
+          boot_notification_module_(std::move(boot_notification_module)),
+          power_management_module_(std::move(power_management_module)),
+          pending_messages_module_(std::move(pending_messages_module)),
+          connector_status_module_(std::move(connector_status_module)),
+          station_(std::move(station)),
+          transaction_listener_(std::move(transaction_listener))
+    {
+        settings_ = platform_->getSettings();
+
+        std::default_random_engine random_engine {std::random_device{}()};
+        std::uniform_int_distribution<int64_t> distribution(
+                std::numeric_limits<int64_t>::min(),
+                std::numeric_limits<int64_t>::max()
+        );
+        unique_index_ = distribution(random_engine);
+
+        stop_transaction_supplier_ = std::make_shared<PendingMessagesModule::saved_message_supplier>(
+                [&](std::function<void(detail::PendingMessageWrapper const&)> const& processor) {
+                    for (auto& entry : active_transactions_) {
+                        if (!entry.second.has_value())
+                            continue;
+
+                        auto const request = generateStopRequest(entry.first, ocpp1_6::Reason::kPowerLoss);
+                        if (request.has_value())
+                            processor(request.value());
+                    }
+                }
+        );
+        pending_messages_module_->registerOnSaveMessageSupplier(stop_transaction_supplier_);
+    }
+
+    TransactionModule1_6::~TransactionModule1_6() {
+        CHARGELAB_LOG_MESSAGE(debug) << "Deleting TransactionModule1_6";
+    }
+
+    void TransactionModule1_6::runStep(ocpp1_6::OcppRemote& remote) {
+        if (connector_status_module_->getPendingReset()) {
+            for (auto& x : active_transactions_) {
+                if (!x.second.has_value())
+                    continue;
+
+                CHARGELAB_LOG_MESSAGE(info) << "Stopping transaction (pending reset) - transaction ID: " << x.second->transaction_id;
+                stopTransaction(x.first, connector_status_module_->getResetReasonHard() ? ocpp1_6::Reason::kHardReset : ocpp1_6::Reason::kSoftReset);
+            }
+            return;
+        }
+
+        auto id_token = station_->readToken1_6();
+        if (id_token != last_rfid_tag_id_) {
+            last_rfid_tag_id_ = id_token;
+            if (id_token.has_value())
+                processRfidTap(id_token->value());
+        }
+
+        for (auto const& entry: station_->getConnectorMetadata()) {
+            auto const connector_status = station_->pollConnectorStatus(entry.first);
+            if (!connector_status.has_value())
+                continue;
+
+            auto const id = entry.second.connector_id1_6;
+            if (connector_status->vehicle_connected == last_plugged_in_state_[id])
+                continue;
+
+            last_plugged_in_state_[id] = connector_status->vehicle_connected;
+            processVehicleConnectedStateChanged(id, connector_status->vehicle_connected);
+        }
+
+        for (auto& entry : pending_start_req_) {
+            if (entry.first > 0)
+                processPendingStartRequest(remote, entry.second);
+        }
+        for (auto& entry : pending_start_req_) {
+            if (entry.first <= 0)
+                processPendingStartRequest(remote, entry.second);
+        }
+
+        std::vector<std::optional<ocpp2_0::EVSEType>> pending;
+        for (auto& entry : pending_start_req_) {
+            if (entry.second.has_value()) {
+                if (entry.first > 0) {
+                    pending.emplace_back(ocpp2_0::EVSEType {entry.first, 1});
+                } else if (entry.first == 0 && entry.second != std::nullopt) {
+                    pending.emplace_back(std::nullopt);
+                }
+            }
+        }
+        connector_status_module_->setPendingStartRequests(pending);
+
+        for (auto& entry : active_transactions_) {
+            if (!entry.second.has_value())
+                continue;
+
+            auto const evse = station_->lookupConnectorId1_6(entry.first);
+            if (!evse.has_value()) {
+                CHARGELAB_LOG_MESSAGE(error) << "Unexpected state: connector did not exist for running transaction - dropping: " << entry.second->transaction_id;
+                entry.second = std::nullopt;
+                continue;
+            }
+
+            bool first_reading = !entry.second->last_reading_timestamp.has_value();
+            if (shouldTakeReading(entry.second->last_reading_timestamp, settings_->MeterValueSampleInterval.getValue()))
+                addReading(entry.second.value(), first_reading ? ocpp1_6::ReadingContext::kTransactionBegin : ocpp1_6::ReadingContext::kSamplePeriodic);
+
+            first_reading = !entry.second->last_clock_aligned_reading_timestamp.has_value();
+            if (shouldTakeReading(entry.second->last_clock_aligned_reading_timestamp, settings_->ClockAlignedDataInterval.getValue()))
+                addReading(entry.second.value(), first_reading ? ocpp1_6::ReadingContext::kTransactionBegin : ocpp1_6::ReadingContext::kSampleClock);
+        }
+
+        if (transaction_listener_ != nullptr) {
+            for (auto const& transaction : active_transactions_) {
+                if (transaction.second.has_value()) {
+                    auto const connector_status = station_->pollConnectorStatus({transaction.first});
+                    transaction_listener_->onTransactionUpdate(
+                        chargelab::TransactionListener1_6::Status::kRunning,
+                        transaction.first,
+                        transaction.second.value(),
+                        connector_status,
+                        std::nullopt);
+                }
+            }
+        }
+    }
+
+    std::optional<ocpp1_6::ResponseToRequest<ocpp1_6::RemoteStartTransactionRsp>>
+    TransactionModule1_6::onRemoteStartTransactionReq(const ocpp1_6::RemoteStartTransactionReq &req) {
+        int connector_id = 0;
+        if (req.connectorId.has_value()) {
+            connector_id = req.connectorId.value();
+
+            bool found = false;
+            for (auto const& entry : station_->getConnectorMetadata()) {
+                if (entry.second.connector_id1_6 == connector_id) {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found)
+                return ocpp1_6::RemoteStartTransactionRsp{ocpp1_6::RemoteStartStopStatus::kRejected};
+        }
+
+        if (req.chargingProfile.has_value()) {
+            if (req.chargingProfile->chargingProfilePurpose != ocpp1_6::ChargingProfilePurposeType::kTxProfile)
+                return ocpp1_6::RemoteStartTransactionRsp {ocpp1_6::RemoteStartStopStatus::kRejected};
+
+            if (req.chargingProfile->transactionId.has_value())
+                return ocpp1_6::RemoteStartTransactionRsp {ocpp1_6::RemoteStartStopStatus::kRejected};
+        }
+
+        bool available_connector = true;
+        for (auto& x : active_transactions_) {
+            if (req.connectorId && req.connectorId == x.first && x.second) {
+                available_connector = false;
+                break;
+            }
+        }
+
+        if (!available_connector)
+            return ocpp1_6::RemoteStartTransactionRsp{ocpp1_6::RemoteStartStopStatus::kRejected};
+
+        pending_start_req_[connector_id] = transaction_module1_6::PendingStartRequest {platform_, req};
+        return ocpp1_6::RemoteStartTransactionRsp {ocpp1_6::RemoteStartStopStatus::kAccepted};
+    }
+
+    void TransactionModule1_6::onAuthorizeRsp(
+            const std::string &unique_id,
+            const std::variant<ocpp1_6::AuthorizeRsp, ocpp1_6::CallError> &rsp
+    ) {
+        for (auto& entry : pending_start_req_) {
+            if (!entry.second.has_value())
+                continue;
+            if (entry.second->pending_authorize_req != unique_id)
+                continue;
+
+            if (std::holds_alternative<ocpp1_6::AuthorizeRsp>(rsp)) {
+                entry.second->pending_authorize_req = kNoOperation;
+
+                auto const& value = std::get<ocpp1_6::AuthorizeRsp>(rsp);
+                CHARGELAB_LOG_MESSAGE(info) << "Received authorize response: " << value;
+                switch (value.idTagInfo.status) {
+                    case ocpp1_6::AuthorizationStatus::kAccepted:
+                        entry.second->authorize_finished = true;
+                        CHARGELAB_LOG_MESSAGE(info) << "Set authorize_finished to true: " << entry.second->authorize_finished;
+                        break;
+
+                    case ocpp1_6::AuthorizationStatus::kValueNotFoundInEnum:
+                    case ocpp1_6::AuthorizationStatus::kBlocked:
+                    case ocpp1_6::AuthorizationStatus::kExpired:
+                    case ocpp1_6::AuthorizationStatus::kInvalid:
+                    case ocpp1_6::AuthorizationStatus::kConcurrentTx:
+                        entry.second = std::nullopt;
+                        break;
+                }
+            } else {
+                CHARGELAB_LOG_MESSAGE(warning) << "Error response to Authorize request: " << std::get<ocpp1_6::CallError>(rsp);
+            }
+        }
+    }
+
+    void TransactionModule1_6::onStartTransactionRsp(
+            const std::string &unique_id,
+            const std::variant<ocpp1_6::StartTransactionRsp, ocpp1_6::CallError> &rsp
+    ) {
+        for (auto& entry : active_transactions_) {
+            if (!entry.second.has_value())
+                continue;
+            if (unique_id != entry.second->start_transaction_request_id)
+                continue;
+
+            if (std::holds_alternative<ocpp1_6::StartTransactionRsp>(rsp)) {
+                auto const &value = std::get<ocpp1_6::StartTransactionRsp>(rsp);
+                entry.second->transaction_id = value.transactionId;
+
+                switch (value.idTagInfo.status) {
+                    case ocpp1_6::AuthorizationStatus::kAccepted:
+                        power_management_module_->onActiveTransactionIdAssigned(entry.first, value.transactionId);
+                        break;
+
+                    case ocpp1_6::AuthorizationStatus::kValueNotFoundInEnum:
+                    case ocpp1_6::AuthorizationStatus::kBlocked:
+                    case ocpp1_6::AuthorizationStatus::kExpired:
+                    case ocpp1_6::AuthorizationStatus::kInvalid:
+                    case ocpp1_6::AuthorizationStatus::kConcurrentTx:
+                        stopTransaction(entry.first, ocpp1_6::Reason::kDeAuthorized);
+                        break;
+                }
+            } else {
+                CHARGELAB_LOG_MESSAGE(warning) << "Error response to StartTransaction request: " << std::get<ocpp1_6::CallError>(rsp);
+            }
+        }
+    }
+
+    std::optional<ocpp1_6::ResponseToRequest<ocpp1_6::RemoteStopTransactionRsp>>
+    TransactionModule1_6::onRemoteStopTransactionReq(const ocpp1_6::RemoteStopTransactionReq &req) {
+        for (auto& entry : active_transactions_) {
+            if (!entry.second.has_value())
+                continue;
+            if (!entry.second->transaction_id.has_value())
+                continue;
+            if (entry.second->transaction_id.value() != req.transactionId)
+                continue;
+
+            stopTransaction(entry.first, ocpp1_6::Reason::kRemote);
+            return ocpp1_6::RemoteStopTransactionRsp {ocpp1_6::RemoteStartStopStatus::kAccepted};
+        }
+
+        if (!settings_->StopTransactionWithDifferentId.getValue())
+            return ocpp1_6::RemoteStopTransactionRsp {ocpp1_6::RemoteStartStopStatus::kRejected};
+        if (!force_stop_transaction_.has_value()) {
+            force_stop_transaction_ = req.transactionId;
+            return ocpp1_6::RemoteStopTransactionRsp {ocpp1_6::RemoteStartStopStatus::kAccepted};
+        } else {
+            return ocpp1_6::RemoteStopTransactionRsp {ocpp1_6::RemoteStartStopStatus::kRejected};
+        }
+    }
+
+    std::optional<ocpp1_6::ResponseToRequest<ocpp1_6::TriggerMessageRsp>>
+    TransactionModule1_6::onTriggerMessageReq(const ocpp1_6::TriggerMessageReq &req) {
+        if (req.requestedMessage != ocpp1_6::MessageTrigger::kMeterValues)
+            return std::nullopt;
+
+        for (auto& entry : active_transactions_) {
+            if (!entry.second.has_value())
+                continue;
+            if (req.connectorId.has_value() && req.connectorId.value() != entry.first)
+                continue;
+
+            addReading(entry.second.value(), ocpp1_6::ReadingContext::kTrigger);
+            return ocpp1_6::TriggerMessageRsp {ocpp1_6::TriggerMessageStatus::kAccepted};
+        }
+
+        return ocpp1_6::TriggerMessageRsp {ocpp1_6::TriggerMessageStatus::kRejected};
+    }
+
+    void TransactionModule1_6::startTransaction(
+            int connector_id,
+            std::string const& id_tag,
+            std::optional<ocpp1_6::ChargingProfile> const& charging_profile
+    ) {
+        auto const group_id = unique_index_++;
+        auto const evse = station_->lookupConnectorId1_6(connector_id);
+        if (!evse.has_value()) {
+            CHARGELAB_LOG_MESSAGE(error) << "Unexpected state - connector ID does not exist: " << connector_id;
+            return;
+        }
+
+        auto const status = station_->pollConnectorStatus(evse.value());
+        if (!status.has_value()) {
+            CHARGELAB_LOG_MESSAGE(error) << "Unexpected state - failed fetching connector status for EVSE: " << evse;
+            return;
+        }
+
+        auto start_transaction_request_id = pending_messages_module_->sendRequest1_6(
+                ocpp1_6::StartTransactionReq {
+                        connector_id,
+                        id_tag,
+                        (int)status->meter_watt_hours,
+                        std::nullopt,
+                        platform_->systemClockNow()
+                },
+                PendingMessagePolicy {
+                        PendingMessageType::kTransactionEvent,
+                        group_id,
+                        settings_->TransactionMessageAttempts.getValue(),
+                        settings_->TransactionMessageRetryInterval.getValue(),
+                        kPriorityStartTransaction,
+                        false,
+                        false,
+                        true
+                }
+        );
+        station_->setChargingEnabled(evse.value(), true);
+
+        active_transactions_[connector_id] = transaction_module1_6::TransactionContainer {
+                connector_id,
+                group_id,
+                id_tag,
+                start_transaction_request_id
+        };
+
+        power_management_module_->onActiveTransactionStarted(connector_id, charging_profile);
+
+        if (transaction_listener_ != nullptr) {
+            auto sampled_values = station_->pollMeterValues1_6(evse.value());
+            transaction_listener_->onTransactionUpdate(
+                chargelab::TransactionListener1_6::Status::kStarted,
+                connector_id,
+                active_transactions_[connector_id].value(),
+                status,
+                sampled_values);
+        }
+    }
+
+    std::optional<detail::PendingMessageWrapper>
+    TransactionModule1_6::generateStopRequest(int connector_id, ocpp1_6::Reason const& reason) {
+        auto const& transaction = active_transactions_[connector_id];
+        if (!transaction.has_value())
+            return std::nullopt;
+
+        auto const evse = station_->lookupConnectorId1_6(connector_id);
+        if (!evse.has_value()) {
+            CHARGELAB_LOG_MESSAGE(error) << "Unexpected state - connector ID does not exist: " << connector_id;
+            return std::nullopt;
+        }
+
+        auto const status = station_->pollConnectorStatus(evse.value());
+        if (!status.has_value()) {
+            CHARGELAB_LOG_MESSAGE(error) << "Unexpected state - failed fetching connector status for EVSE: " << evse;
+            return std::nullopt;
+        }
+
+        auto pending_msg = pending_messages_module_->generateRequest1_6(
+                ocpp1_6::StopTransactionReq {
+                        transaction->id_tag,
+                        (int)status->meter_watt_hours,
+                        platform_->systemClockNow(),
+                        transaction->transaction_id.value_or(0),
+                        reason,
+                        {}
+                },
+                PendingMessagePolicy {
+                        PendingMessageType::kTransactionEvent,
+                        transaction->group_id,
+                        settings_->TransactionMessageAttempts.getValue(),
+                        settings_->TransactionMessageRetryInterval.getValue(),
+                        kPriorityStopTransaction,
+                        false,
+                        false
+                }
+        );
+        power_management_module_->onActiveTransactionFinished(connector_id);
+
+        if (transaction_listener_ != nullptr) {
+            auto sampled_values = station_->pollMeterValues1_6(evse.value());
+            transaction_listener_->onTransactionUpdate(
+                chargelab::TransactionListener1_6::Status::kPersistedStopCheckpoint,
+                connector_id,
+                active_transactions_[connector_id].value(),
+                status,
+                sampled_values);
+        }
+
+        return pending_msg;
+    }
+
+    void TransactionModule1_6::stopTransaction(int connector_id, ocpp1_6::Reason const& reason) {
+        std::optional<transaction_module1_6::TransactionContainer> transaction = std::nullopt;
+        std::swap(transaction, active_transactions_[connector_id]);
+        if (!transaction.has_value())
+            return;
+
+        auto const evse = station_->lookupConnectorId1_6(connector_id);
+        if (!evse.has_value()) {
+            CHARGELAB_LOG_MESSAGE(error) << "Unexpected state - connector ID does not exist: " << connector_id;
+            return;
+        }
+
+        auto const status = station_->pollConnectorStatus(evse.value());
+        station_->setChargingEnabled(evse.value(), false);
+
+        if (!status.has_value()) {
+            CHARGELAB_LOG_MESSAGE(error) << "Unexpected state - failed fetching connector status for EVSE: " << evse;
+            return;
+        }
+
+        pending_messages_module_->sendRequest1_6(
+                ocpp1_6::StopTransactionReq {
+                        transaction->id_tag,
+                        (int)status->meter_watt_hours,
+                        platform_->systemClockNow(),
+                        transaction->transaction_id.value_or(0),
+                        reason,
+                        {}
+                },
+                PendingMessagePolicy {
+                        PendingMessageType::kTransactionEvent,
+                        transaction->group_id,
+                        settings_->TransactionMessageAttempts.getValue(),
+                        settings_->TransactionMessageRetryInterval.getValue(),
+                        kPriorityStopTransaction,
+                        false,
+                        false,
+                        true
+                }
+        );
+        power_management_module_->onActiveTransactionFinished(connector_id);
+
+        if (transaction_listener_ != nullptr) {
+            auto sampled_values = station_->pollMeterValues1_6(evse.value());
+            transaction_listener_->onTransactionUpdate(
+                chargelab::TransactionListener1_6::Status::kStopped,
+                connector_id,
+                active_transactions_[connector_id].value(),
+                status,
+                sampled_values);
+        }
+    }
+
+    void TransactionModule1_6::processRfidTap(std::string const& id_tag) {
+        for (auto& x : active_transactions_) {
+            if (!x.second.has_value())
+                continue;
+            if (string::EqualsIgnoreCaseAscii(x.second->id_tag, id_tag)) {
+                stopTransaction(x.first, ocpp1_6::Reason::kLocal);
+                return;
+            }
+        }
+
+        bool found_available_connector = false;
+        for (auto const& entry: station_->getConnectorMetadata()) {
+            if (entry.first.id == 0) continue;
+            auto const connector_status = station_->pollConnectorStatus(entry.first);
+            if (!connector_status.has_value())
+                continue;
+            if (connector_status->connector_available) {
+                found_available_connector = true;
+                break;
+            }
+        }
+
+        if (!found_available_connector)
+            return;
+
+        pending_start_req_[0] = transaction_module1_6::PendingStartRequest{platform_, 0, id_tag};
+    }
+
+    void TransactionModule1_6::processVehicleConnectedStateChanged(int connector_id, bool connected) {
+        if (active_transactions_[connector_id].has_value()) {
+            if (!connected) {
+                stopTransaction(connector_id, ocpp1_6::Reason::kEVDisconnected);
+            }
+            return;
+        }
+
+        auto plug_and_charge_id = settings_->PlugAndChargeId.getValue();
+        if (connected && !plug_and_charge_id.empty()) {
+            if (pending_start_req_[0].has_value() || pending_start_req_[connector_id].has_value())
+                return;
+
+            pending_start_req_[connector_id] = transaction_module1_6::PendingStartRequest {
+                    platform_,
+                    connector_id,
+                    plug_and_charge_id
+            };
+        }
+    }
+
+    void TransactionModule1_6::processPendingStartRequest(ocpp1_6::OcppRemote& remote, std::optional<transaction_module1_6::PendingStartRequest>& pending) {
+        if (!pending.has_value())
+            return;
+
+        auto const elapsed = platform_->steadyClockNow() - pending->created_timestamp;
+        if (elapsed >= settings_->ConnectionTimeOut.getValue()*1000) {
+            pending = std::nullopt;
+            return;
+        }
+
+        if (!pending->authorize_finished) {
+            if (treatAsConnected()) {
+                if (!pending->pending_authorize_req.operationInProgress()) {
+                    pending->pending_authorize_req.setWithTimeout(
+                            settings_->DefaultMessageTimeout.getValue(),
+                            remote.sendAuthorizeReq(ocpp1_6::AuthorizeReq {pending->tag_id})
+                    );
+                }
+                return;
+            } else if (!settings_->AllowOfflineTxForUnknownId.getValue()) {
+                return;
+            }
+        }
+
+        for (auto const& entry : station_->getConnectorMetadata()) {
+            auto const id = entry.second.connector_id1_6;
+            if (pending->connector_id != 0 && pending->connector_id != id)
+                continue;
+
+            auto const status = station_->pollConnectorStatus(entry.first);
+            if (!status.has_value() || !status->vehicle_connected)
+                continue;
+            if (active_transactions_[id].has_value())
+                continue;
+
+            startTransaction(id, pending->tag_id, pending->charging_profile);
+            pending = std::nullopt;
+        }
+    }
+
+    void TransactionModule1_6::addReading(
+            transaction_module1_6::TransactionContainer& entry,
+            ocpp1_6::ReadingContext const& context
+    ) {
+        auto const evse = station_->lookupConnectorId1_6(entry.connector_id);
+        if (!evse.has_value()) {
+            CHARGELAB_LOG_MESSAGE(error) << "Unexpected state - connector ID does not exist: " << entry.connector_id;
+            return;
+        }
+
+        auto enabled = parseMeasurandsString(settings_->MeterValuesSampledData.getValue());
+        auto sampled_values = station_->pollMeterValues1_6(evse.value());
+        sampled_values.erase(
+                std::remove_if(
+                        sampled_values.begin(),
+                        sampled_values.end(),
+                        [&](ocpp1_6::SampledValue const& value) {
+                            auto measurand = value.measurand.value_or(ocpp1_6::Measurand::kEnergyActiveImportRegister);
+                            return enabled.find(measurand) == enabled.end();
+                        }
+                ),
+                sampled_values.end()
+        );
+
+        for (auto& value : sampled_values)
+            value.context = context;
+
+        pending_messages_module_->sendRequest1_6(
+                ocpp1_6::MeterValuesReq {
+                        entry.connector_id,
+                        entry.transaction_id.value_or(0),
+                        {ocpp1_6::MeterValue {platform_->systemClockNow(), std::move(sampled_values)}}
+                },
+                PendingMessagePolicy {
+                        PendingMessageType::kTransactionEvent,
+                        entry.group_id,
+                        settings_->TransactionMessageAttempts.getValue(),
+                        settings_->TransactionMessageRetryInterval.getValue(),
+                        kPriorityMeterValue,
+                        false,
+                        false
+                }
+        );
+    }
+
+    bool TransactionModule1_6::shouldTakeReading(std::optional<SteadyPointMillis>& last, int interval_seconds) {
+        if (interval_seconds <= 0)
+            return false;
+
+        auto const now = platform_->steadyClockNow();
+        if (last.has_value()) {
+            auto const delta = now - last.value();
+            if (delta < interval_seconds*1000)
+                return false;
+        }
+
+        last = now;
+        return true;
+    }
+
+    bool TransactionModule1_6::treatAsConnected() {
+        if (!boot_notification_module_->registrationComplete())
+            return false;
+
+        auto const websocket = platform_->ocppConnection();
+        if (websocket == nullptr)
+            return false;
+
+        return websocket->isConnected();
+    }
+
+    std::unordered_set<ocpp1_6::Measurand::Value> TransactionModule1_6::parseMeasurandsString(std::string const& measurands) {
+        std::unordered_set<ocpp1_6::Measurand::Value> ret;
+        string::SplitVisitor(measurands, ",", [&](std::string const& value) {
+            auto value_as_enum = ocpp1_6::Measurand::from_string(value);
+            if (value_as_enum == ocpp1_6::Measurand::kValueNotFoundInEnum) {
+                CHARGELAB_LOG_MESSAGE(error) << "Unexpected measurand: " << value;
+            } else {
+                ret.insert(value_as_enum);
+            }
+        });
+        return ret;
+    }
+}
