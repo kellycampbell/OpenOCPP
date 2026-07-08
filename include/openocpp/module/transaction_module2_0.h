@@ -46,7 +46,8 @@ namespace chargelab {
                   charging_profile {},
                   remote_start_id {},
                   evse {evse},
-                  authorize_finished {false}
+                  // AuthCtrlr.AuthEnabled - if authorization is disabled, treat every presented token as pre-authorized
+                  authorize_finished {!platform->getSettings()->AuthEnabled.getValue()}
             {
             }
 
@@ -57,8 +58,11 @@ namespace chargelab {
                   group_id_token {req.groupIdToken},
                   charging_profile {req.chargingProfile},
                   remote_start_id {req.remoteStartId},
-                  // F01.FR.01/F01.FR.02
-                  authorize_finished {!platform->getSettings()->AuthorizeRemoteTxRequests.getValue()}
+                  // F01.FR.01/F01.FR.02, AuthCtrlr.AuthEnabled
+                  authorize_finished {
+                      !platform->getSettings()->AuthEnabled.getValue() ||
+                      !platform->getSettings()->AuthorizeRemoteTxRequests.getValue()
+                  }
             {
                 if (req.evseId.has_value()) {
                     evse = ocpp2_0::EVSEType {req.evseId.value()};

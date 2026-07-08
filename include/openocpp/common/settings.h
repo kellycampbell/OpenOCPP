@@ -1440,6 +1440,19 @@ namespace chargelab {
                 [](auto const&) {return true;}
         };
 
+        SettingBool AuthEnabled {
+                []() {
+                    return SettingMetadata {
+                            "AuthEnabled",
+                            SettingConfig::rwPolicy(),
+                            std::nullopt,
+                            DeviceModel2_0 {{"AuthCtrlr"}, {"AuthEnabled"}, {std::nullopt, ocpp2_0::DataEnumType::kboolean}},
+                            SettingBool::kTextTrue
+                    };
+                },
+                [](auto const&) {return true;}
+        };
+
         SettingBool AuthorizeRemoteTxRequests {
                 []() {
                     return SettingMetadata {
@@ -3240,6 +3253,7 @@ namespace chargelab {
                     &AlignedDataTxEndedInterval,
                     &AlignedDataTxEndedMeasurands,
                     &AllowOfflineTxForUnknownId,
+                    &AuthEnabled,
                     &AuthorizeRemoteTxRequests,
                     &BackendTransitionRequested,
                     &BasicAuthPassword,
