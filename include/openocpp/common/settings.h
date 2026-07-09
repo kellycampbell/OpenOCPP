@@ -277,12 +277,31 @@ namespace chargelab {
             modified_ = modified;
         }
 
+        [[nodiscard]] bool getLoadedFromStorage() const {
+            return loaded_from_storage_;
+        }
+
+        void setLoadedFromStorage(bool loaded) {
+            loaded_from_storage_ = loaded;
+        }
+
+        // Overrides the compiled-in default value unless a value for this setting was loaded from storage, in which
+        // case the stored value is kept. Call after Settings::loadFromStorage and before the first saveIfModified;
+        // once a value has been persisted the stored value always wins on subsequent boots.
+        bool setFactoryDefault(std::string const& value) {
+            if (loaded_from_storage_)
+                return false;
+
+            return setValueFromString(value);
+        }
+
     private:
         metadata_container_type metadata_;
 
         // Note: default modified state is true. If this setting is read from a file or written to a file the flag is
         // cleared.
         std::atomic<bool> modified_ = true;
+        std::atomic<bool> loaded_from_storage_ = false;
     };
 
     class SettingString : public SettingBase {
@@ -3593,8 +3612,10 @@ namespace chargelab {
                             if (!string::EqualsIgnoreCaseAscii(p->getId(), record.key))
                                 continue;
 
-                            if (p->load(record.value))
+                            if (p->load(record.value)) {
                                 p->setModified(false);
+                                p->setLoadedFromStorage(true);
+                            }
 
                             CHARGELAB_LOG_MESSAGE(info) << "Load settings: " << record;
                             loaded_setting = true;
