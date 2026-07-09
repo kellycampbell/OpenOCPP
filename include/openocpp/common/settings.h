@@ -275,6 +275,9 @@ namespace chargelab {
 
         void setModified(bool modified) {
             modified_ = modified;
+            if (modified) {
+                factory_default_only_ = false;
+            }
         }
 
         [[nodiscard]] bool getLoadedFromStorage() const {
@@ -285,14 +288,25 @@ namespace chargelab {
             loaded_from_storage_ = loaded;
         }
 
-        // Overrides the compiled-in default value unless a value for this setting was loaded from storage, in which
-        // case the stored value is kept. Call after Settings::loadFromStorage and before the first saveIfModified;
-        // once a value has been persisted the stored value always wins on subsequent boots.
-        bool setFactoryDefault(std::string const& value) {
-            if (loaded_from_storage_)
-                return false;
+        [[nodiscard]] bool isFactoryDefaultOnly() const {
+            return factory_default_only_;
+        }
 
-            return setValueFromString(value);
+        // Overrides the compiled-in default value unless a value for this setting was loaded from storage, in which
+        // case the stored value is kept. A setting holding only a factory default is excluded from saveIfModified,
+        // so the default can still be changed by a firmware update; the value is persisted (and from then on takes
+        // precedence over future defaults) only once it is modified through some other path.
+        bool setFactoryDefault(std::string const& value) {
+            if (loaded_from_storage_) {
+                return false;
+            }
+            if (!setValueFromString(value)) {
+                return false;
+            }
+
+            modified_ = false;
+            factory_default_only_ = true;
+            return true;
         }
 
     private:
@@ -302,6 +316,7 @@ namespace chargelab {
         // cleared.
         std::atomic<bool> modified_ = true;
         std::atomic<bool> loaded_from_storage_ = false;
+        std::atomic<bool> factory_default_only_ = false;
     };
 
     class SettingString : public SettingBase {
@@ -3422,6 +3437,8 @@ namespace chargelab {
                         if (p == nullptr)
                             continue;
                         if (!p->getConfig().isIncludeInSave())
+                            continue;
+                        if (p->isFactoryDefaultOnly())
                             continue;
 
                         file::json_write_object_to_file(file, detail::SettingKeyValue{
