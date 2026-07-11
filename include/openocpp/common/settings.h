@@ -2052,7 +2052,7 @@ namespace chargelab {
                             "DiagnosticFreeHeap",
                             SettingConfig::roNotSavedPolicy(),
                             DeviceModel1_6 {"DiagnosticFreeHeap"},
-                            DeviceModel2_0 {{"CustomizationCtrlr"}, {"ConnectorAvailabilities"}, {std::nullopt, ocpp2_0::DataEnumType::kinteger}},
+                            DeviceModel2_0 {{"CustomizationCtrlr"}, {"DiagnosticFreeHeap"}, {std::nullopt, ocpp2_0::DataEnumType::kinteger}},
                             std::to_string(0)
                     };
                 },
@@ -2065,7 +2065,7 @@ namespace chargelab {
                             "DiagnosticFreeHeapMinimum",
                             SettingConfig::roNotSavedPolicy(),
                             DeviceModel1_6 {"DiagnosticFreeHeapMinimum"},
-                            DeviceModel2_0 {{"CustomizationCtrlr"}, {"ConnectorAvailabilities"}, {std::nullopt, ocpp2_0::DataEnumType::kinteger}},
+                            DeviceModel2_0 {{"CustomizationCtrlr"}, {"DiagnosticFreeHeapMinimum"}, {std::nullopt, ocpp2_0::DataEnumType::kinteger}},
                             std::to_string(0)
                     };
                 },
