@@ -83,7 +83,11 @@ namespace chargelab {
 
         enum class Result {
             kSucceeded,
-            kFailed
+            kFailed,
+
+            // Permanent failure - the firmware image failed verification (e.g. it targets
+            // different hardware). The update should not be retried.
+            kVerificationFailed
         };
 
     public:

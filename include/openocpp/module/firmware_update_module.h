@@ -549,7 +549,14 @@ namespace chargelab {
                         }
                     }
 
-                    if (station_->processFirmwareChunk(operation_->buffer.data(), bytes_read) != StationInterface::Result::kSucceeded) {
+                    auto const chunk_result = station_->processFirmwareChunk(operation_->buffer.data(), bytes_read);
+                    if (chunk_result == StationInterface::Result::kVerificationFailed) {
+                        CHARGELAB_LOG_MESSAGE(warning) << "Firmware image failed verification - abandoning update";
+                        operation_->running_firmware_update = false;
+                        checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInstallVerificationFailed);
+                        operation_ = std::nullopt;
+                        return;
+                    } else if (chunk_result != StationInterface::Result::kSucceeded) {
                         CHARGELAB_LOG_MESSAGE(warning) << "Failed processing firmware chunk";
                         operation_->connection = nullptr;
                         operation_->total_failures++;
@@ -683,7 +690,15 @@ namespace chargelab {
                     }
                 }
 
-                if (station_->processFirmwareChunk(operation_->buffer.data(), bytes_read) != StationInterface::Result::kSucceeded) {
+                auto const chunk_result = station_->processFirmwareChunk(operation_->buffer.data(), bytes_read);
+                if (chunk_result == StationInterface::Result::kVerificationFailed) {
+                    // OCPP 1.6 has no InstallVerificationFailed status - report InstallationFailed
+                    CHARGELAB_LOG_MESSAGE(warning) << "Firmware image failed verification - abandoning update";
+                    operation_->running_firmware_update = false;
+                    checkAndUpdateStatus(ocpp1_6::FirmwareStatus::kInstallationFailed);
+                    operation_ = std::nullopt;
+                    return;
+                } else if (chunk_result != StationInterface::Result::kSucceeded) {
                     CHARGELAB_LOG_MESSAGE(warning) << "Failed processing firmware chunk";
                     operation_->connection = nullptr;
                     operation_->total_failures++;
