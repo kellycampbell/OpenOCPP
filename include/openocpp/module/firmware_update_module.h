@@ -410,6 +410,11 @@ namespace chargelab {
                     operation_->signature_hash->update((unsigned char const*)operation_->buffer.data(), bytes_read);
                     operation_->total_bytes_read += bytes_read;
                     CHARGELAB_LOG_MESSAGE(debug) << "Hashing progress: " << operation_->total_bytes_read << " / " << operation_->content_length;
+                    station_->notifyUpdateProgress(
+                            StationInterface::UpdatePhase::kDownloading,
+                            operation_->total_bytes_read,
+                            operation_->content_length
+                    );
                 }
 
                 if (operation_->total_bytes_read >= operation_->content_length) {

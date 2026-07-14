@@ -90,6 +90,11 @@ namespace chargelab {
             kVerificationFailed
         };
 
+        enum class UpdatePhase {
+            kDownloading,
+            kInstalling
+        };
+
     public:
         virtual ~StationInterface() = default;
 
@@ -256,6 +261,18 @@ namespace chargelab {
          * @return kSucceeded on success, otherwise kFailed
          */
         virtual Result finishUpdateProcess(bool succeeded) = 0;
+
+        /**
+         * Notifies the station of firmware update download progress so it can drive a local
+         * display (e.g. LEDs). Called by the firmware update module during phases that don't
+         * otherwise touch the station interface, such as the OCPP 2.0 download/signature pass.
+         * Default is a no-op.
+         *
+         * @param phase the current update phase
+         * @param bytes bytes processed so far in this phase
+         * @param total total bytes expected in this phase; may be 0 if unknown
+         */
+        virtual void notifyUpdateProgress(UpdatePhase phase, std::size_t bytes, std::size_t total) {}
 
     public:
         /**
