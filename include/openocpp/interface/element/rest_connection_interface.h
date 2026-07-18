@@ -2,6 +2,7 @@
 #define CHARGELAB_OPEN_FIRMWARE_REST_CONNECTION_INTERFACE_H
 
 #include <optional>
+#include <string>
 
 namespace chargelab {
     class RestConnectionInterface {

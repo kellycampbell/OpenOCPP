@@ -1,0 +1,1577 @@
+#include "openocpp/module/transaction_module2_0.h"
+
+namespace chargelab {
+
+TransactionModule2_0::TransactionModule2_0(
+        std::shared_ptr<PlatformInterface> platform,
+        std::shared_ptr<BootNotificationModule> boot_notification_module,
+        std::shared_ptr<PowerManagementModule2_0> power_management_module,
+        std::shared_ptr<PendingMessagesModule> pending_messages_module,
+        std::shared_ptr<ConnectorStatusModule> connector_status_module,
+        std::shared_ptr<StationInterface> station,
+        std::shared_ptr<TransactionListener2_0> transaction_listener
+) : platform_(std::move(platform)),
+    boot_notification_module_(std::move(boot_notification_module)),
+    power_management_module_(std::move(power_management_module)),
+    pending_messages_module_(std::move(pending_messages_module)),
+    connector_status_module_(std::move(connector_status_module)),
+    station_(std::move(station)),
+    transaction_listener_(std::move(transaction_listener)),
+    random_engine_ {std::random_device{}()}
+{
+    settings_ = platform_->getSettings();
+
+    std::uniform_int_distribution<int64_t> distribution(
+            std::numeric_limits<int64_t>::min(),
+            std::numeric_limits<int64_t>::max()
+    );
+    unique_index_ = distribution(random_engine_);
+
+    stop_transaction_supplier_ = std::make_shared<PendingMessagesModule::saved_message_supplier> (
+            [&](std::function<void(detail::PendingMessageWrapper const&)> const& processor) {
+                for (auto& entry : active_transactions_) {
+                    if (!entry.second.has_value())
+                        continue;
+
+                    processor(generateStopRequest(
+                            entry.second.value(),
+                            entry.first,
+                            ocpp2_0::TriggerReasonEnumType::kAbnormalCondition,
+                            ocpp2_0::ReasonEnumType::kPowerLoss,
+                            std::nullopt
+                    ));
+                }
+            }
+    );
+    pending_messages_module_->registerOnSaveMessageSupplier(stop_transaction_supplier_);
+}
+
+TransactionModule2_0::~TransactionModule2_0() {
+    CHARGELAB_LOG_MESSAGE(debug) << "Deleting TransactionModule2_0";
+    if (stop_transaction_supplier_ != nullptr) {
+        pending_messages_module_->unregisterOnSaveMessageSupplier(stop_transaction_supplier_);
+    }
+}
+
+void TransactionModule2_0::runStep(ocpp2_0::OcppRemote& remote) {
+    auto const& metadata = station_->getConnectorMetadata();
+
+    auto id_token = station_->readToken2_0();
+    if (id_token != last_rfid_tag_id_) {
+        last_rfid_tag_id_ = id_token;
+        if (id_token.has_value())
+            processRfidTap(id_token.value());
+    }
+
+    if (connector_status_module_->getResetReasonHard()) {
+        for (auto& x : active_transactions_) {
+            if (!x.second.has_value())
+                continue;
+
+            CHARGELAB_LOG_MESSAGE(info) << "Stopping transaction (pending reset) - transaction ID: " << x.second->transaction_id;
+            stopTransaction(
+                    x.first,
+                    ocpp2_0::TriggerReasonEnumType::kResetCommand,
+                    ocpp2_0::ReasonEnumType::kImmediateReset,
+                    std::nullopt
+            );
+        }
+    }
+
+    for (auto& entry : active_transactions_) {
+        if (!entry.second.has_value())
+            continue;
+        if (!entry.first.has_value())
+            continue;
+
+        auto const status = station_->pollConnectorStatus(entry.first.value());
+        if (status.has_value() && status->vehicle_connected)
+            entry.second->plugged_in = true;
+    }
+
+    for (auto const& entry : metadata) {
+        auto const status = station_->pollConnectorStatus(entry.first);
+        if (!status.has_value())
+            continue;
+        if (status->vehicle_connected == last_plugged_in_state_[entry.first])
+            continue;
+
+        last_plugged_in_state_[entry.first] = status->vehicle_connected;
+        processVehicleConnectedStateChanged(entry.first, status->vehicle_connected);
+    }
+
+    for (auto const& entry : metadata) {
+        auto const status = station_->pollConnectorStatus(entry.first);
+        if (!status.has_value())
+            continue;
+        if (status->charging_enabled == last_charging_enabled_state_[entry.first])
+            continue;
+
+        last_charging_enabled_state_[entry.first] = status->charging_enabled;
+        processChargingEnabledStateChanged(entry.first, status->charging_enabled);
+    }
+
+    for (auto& entry : pending_start_req_) {
+        if (entry.first.has_value() && entry.first->connectorId.has_value())
+            processPendingStartRequest(remote, entry.second);
+    }
+
+    for (auto& entry : pending_start_req_) {
+        if (entry.first.has_value() && !entry.first->connectorId.has_value())
+            processPendingStartRequest(remote, entry.second);
+    }
+
+    for (auto& entry : pending_start_req_) {
+        if (!entry.first.has_value())
+            processPendingStartRequest(remote, entry.second);
+    }
+
+    for (auto& entry : active_transactions_) {
+        if (!entry.second.has_value())
+            continue;
+
+        if (!entry.first.has_value() || !entry.second->plugged_in) {
+            auto const elapsed = platform_->steadyClockNow() - entry.second->start_ts;
+            if (elapsed > settings_->ConnectionTimeOut.getValue()*1000) {
+                CHARGELAB_LOG_MESSAGE(info) << "Stopping transaction (EVConnectionTimeOut) - transaction ID: " << entry.second->transaction_id;
+                stopTransaction(
+                        entry.first,
+                        ocpp2_0::TriggerReasonEnumType::kEVConnectTimeout,
+                        ocpp2_0::ReasonEnumType::kTimeout,
+                        std::nullopt
+                );
+                continue;
+            }
+        }
+
+        if (shouldTakeReading(entry.second->last_sampled_reading_timestamp, settings_->MeterValueSampleInterval.getValue())) {
+            addSampledReading(
+                    entry.second->last_sampled_reading_timestamp,
+                    entry.first,
+                    entry.second.value(),
+                    ocpp2_0::TriggerReasonEnumType::kMeterValuePeriodic,
+                    ocpp2_0::ReadingContextEnumType::kSample_Periodic,
+                    settings_->MeterValuesSampledData.getValue()
+            );
+        }
+
+        if (shouldTakeReading(entry.second->last_sampled_ended_meter_values_timestamp, settings_->SampledDataTxEndedInterval.getValue())) {
+            addEndedReading(
+                    entry.second->last_sampled_ended_meter_values_timestamp,
+                    entry.first,
+                    entry.second.value(),
+                    ocpp2_0::ReadingContextEnumType::kSample_Periodic,
+                    settings_->StopTxnSampledData.getValue()
+            );
+        }
+
+        if (shouldTakeReading(entry.second->last_clock_aligned_reading_timestamp, settings_->ClockAlignedDataInterval.getValue())) {
+            addSampledReading(
+                    entry.second->last_clock_aligned_reading_timestamp,
+                    entry.first,
+                    entry.second.value(),
+                    ocpp2_0::TriggerReasonEnumType::kMeterValueClock,
+                    ocpp2_0::ReadingContextEnumType::kSample_Clock,
+                    settings_->MeterValuesAlignedData.getValue()
+            );
+        }
+
+        if (shouldTakeReading(entry.second->last_clock_aligned_ended_meter_values_timestamp, settings_->AlignedDataTxEndedInterval.getValue())) {
+            addEndedReading(
+                    entry.second->last_clock_aligned_ended_meter_values_timestamp,
+                    entry.first,
+                    entry.second.value(),
+                    ocpp2_0::ReadingContextEnumType::kSample_Clock,
+                    settings_->AlignedDataTxEndedMeasurands.getValue()
+            );
+        }
+
+        auto const status = getChargingState(entry.first, entry.second.value());
+        if (entry.second->last_charging_status != std::make_optional(status)) {
+            updateTransaction(
+                    entry.first,
+                    std::nullopt,
+                    std::nullopt,
+                    ocpp2_0::TriggerReasonEnumType::kChargingStateChanged,
+                    platform_->systemClockNow()
+            );
+        }
+    }
+
+    auto const last_trigger_delta = platform_->systemClockNow() - last_non_transaction_meter_value_trigger_;
+    if (shouldTakeReading(last_non_transaction_meter_value_trigger_, settings_->ClockAlignedDataInterval.getValue())) {
+        if (std::abs(last_trigger_delta) < kMillisecondsInDay) {
+            for (auto const& entry : station_->getConnectorMetadata()) {
+                auto const& transaction = active_transactions_[entry.first];
+                if (transaction.has_value())
+                    continue;
+
+                auto meter_values = getMeterValues(
+                        entry.first,
+                        ocpp2_0::ReadingContextEnumType::kSample_Clock,
+                        settings_->MeterValuesAlignedData.getValue(),
+                        last_non_transaction_meter_value_trigger_
+                );
+                if (!meter_values.filtered.has_value())
+                    continue;
+
+                pending_messages_module_->sendRequest2_0(
+                        ocpp2_0::MeterValuesRequest {
+                                entry.first.id,
+                                std::move(meter_values.filtered.value())
+                        },
+                        PendingMessagePolicy {
+                                PendingMessageType::kNotificationEvent,
+                                kMeterValuesGroupId,
+                                settings_->TransactionMessageAttempts.getValue(),
+                                settings_->TransactionMessageRetryInterval.getValue(),
+                                kPriorityMeterValuesNotification,
+                                false,
+                                true
+                        }
+                );
+            }
+        }
+    }
+
+    for (auto& entry : active_transactions_) {
+        if (!entry.first.has_value() || !entry.second.has_value())
+            continue;
+        if (!entry.first->connectorId.has_value())
+            continue;
+
+        auto const status = station_->pollConnectorStatus(entry.first.value());
+        if (!status.has_value()) {
+            CHARGELAB_LOG_MESSAGE(error) << "Unexpected state: connector did not exist for running transaction - dropping: " << entry.second->transaction_id;
+            entry.second = std::nullopt;
+            continue;
+        }
+
+        if (entry.second->authorized && !entry.second->deauthorized && status->vehicle_connected) {
+            power_management_module_->onActiveTransactionStarted(
+                    entry.first->id,
+                    std::move(entry.second->charging_profile),
+                    entry.second->start_ts
+            );
+            station_->setChargingEnabled(entry.first.value(), true);
+        } else {
+            station_->setChargingEnabled(entry.first.value(), false);
+        }
+    }
+
+    if (transaction_listener_ != nullptr) {
+        for (auto const& transaction : active_transactions_) {
+            if (transaction.first.has_value() && transaction.second.has_value()) {
+                transaction_listener_->onTransactionUpdate(
+                    chargelab::TransactionListener2_0::Status::kRunning,
+                    transaction.first,
+                    transaction.second.value(),
+                    station_->pollConnectorStatus(transaction.first.value()),
+                    std::nullopt);
+             }
+        }
+    }
+}
+
+std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::RequestStartTransactionResponse>>
+TransactionModule2_0::onRequestStartTransactionReq(const ocpp2_0::RequestStartTransactionRequest &req) {
+    auto const& metadata = station_->getConnectorMetadata();
+    if (req.evseId.has_value()) {
+        bool found = false;
+        for (auto const& x : metadata) {
+            if (x.first.id == req.evseId.value()) {
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            CHARGELAB_LOG_MESSAGE(info) << "Rejected RequestStartTransactionRequest - evseId not found";
+            return ocpp2_0::RequestStartTransactionResponse{ocpp2_0::RequestStartStopStatusEnumType::kRejected};
+        }
+    }
+
+    if (req.chargingProfile.has_value()) {
+        // F01.FR.09
+        if (req.chargingProfile->chargingProfilePurpose != ocpp2_0::ChargingProfilePurposeEnumType::kTxProfile) {
+            // F01.FR.26
+            CHARGELAB_LOG_MESSAGE(info) << "Rejected RequestStartTransactionRequest - bad charging profile purpose";
+            return ocpp2_0::RequestStartTransactionResponse{ocpp2_0::RequestStartStopStatusEnumType::kRejected};
+        }
+
+        // F01.FR.11
+        if (req.chargingProfile->transactionId.has_value()) {
+            // F01.FR.26
+            CHARGELAB_LOG_MESSAGE(info) << "Rejected RequestStartTransactionRequest - unexpected charging profile transaction ID";
+            return ocpp2_0::RequestStartTransactionResponse{ocpp2_0::RequestStartStopStatusEnumType::kRejected};
+        }
+    }
+
+    std::set<int> available_evse_ids;
+    for (auto const& x : metadata)
+        available_evse_ids.insert(x.first.id);
+    for (auto const& x : active_transactions_) {
+        if (x.second.has_value() && x.second->authorized && x.first.has_value())
+            available_evse_ids.erase(x.first->id);
+    }
+
+    bool available_connector;
+    if (req.evseId.has_value()) {
+        available_connector = available_evse_ids.find(req.evseId.value()) != available_evse_ids.end();
+    } else {
+        available_connector = !available_evse_ids.empty();
+    }
+
+    if (!available_connector) {
+        CHARGELAB_LOG_MESSAGE(info) << "Rejected RequestStartTransactionRequest - no EVSE available";
+        return ocpp2_0::RequestStartTransactionResponse{ocpp2_0::RequestStartStopStatusEnumType::kRejected};
+    }
+
+    std::optional<ocpp2_0::EVSEType> evse {};
+    if (req.evseId.has_value())
+        evse->id = req.evseId.value();
+
+    pending_start_req_[evse] = transaction_module2_0::PendingStartRequest {platform_, req};
+    return ocpp2_0::RequestStartTransactionResponse{ocpp2_0::RequestStartStopStatusEnumType::kAccepted};
+}
+
+void TransactionModule2_0::onAuthorizeRsp(
+        const std::string &unique_id,
+        const std::variant<ocpp2_0::AuthorizeResponse, ocpp2_0::CallError> &rsp
+) {
+    bool found = false;
+    for (auto& entry : pending_start_req_) {
+        if (!entry.second.has_value())
+            continue;
+        if (entry.second->pending_authorize_req != unique_id)
+            continue;
+
+        found = true;
+        if (std::holds_alternative<ocpp2_0::AuthorizeResponse>(rsp)) {
+            entry.second->pending_authorize_req = kNoOperation;
+
+            auto const& value = std::get<ocpp2_0::AuthorizeResponse>(rsp);
+            switch (value.idTokenInfo.status) {
+                case ocpp2_0::AuthorizationStatusEnumType::kAccepted:
+                    if (stopByGroupId(entry.second->id_token, value.idTokenInfo.groupIdToken)) {
+                        // C09.FR.03
+                        CHARGELAB_LOG_MESSAGE(info) << "Interpreting Authorize response as a stop transaction request based on group ID";
+                        entry.second = std::nullopt;
+                    } else {
+                        CHARGELAB_LOG_MESSAGE(info) << "Matched Authorize response and set authorize finished to true";
+                        entry.second->group_id_token = value.idTokenInfo.groupIdToken;
+                        entry.second->authorize_finished = true;
+                    }
+                    break;
+
+                case ocpp2_0::AuthorizationStatusEnumType::kValueNotFoundInEnum:
+                case ocpp2_0::AuthorizationStatusEnumType::kBlocked:
+                case ocpp2_0::AuthorizationStatusEnumType::kConcurrentTx:
+                case ocpp2_0::AuthorizationStatusEnumType::kExpired:
+                case ocpp2_0::AuthorizationStatusEnumType::kInvalid:
+                case ocpp2_0::AuthorizationStatusEnumType::kNoCredit:
+                case ocpp2_0::AuthorizationStatusEnumType::kNotAllowedTypeEVSE:
+                case ocpp2_0::AuthorizationStatusEnumType::kNotAtThisLocation:
+                case ocpp2_0::AuthorizationStatusEnumType::kNotAtThisTime:
+                case ocpp2_0::AuthorizationStatusEnumType::kUnknown:
+                    // F01.FR.03
+                    CHARGELAB_LOG_MESSAGE(info) << "Matched Authorize response and removed pending start request";
+                    entry.second = std::nullopt;
+                    break;
+            }
+        } else {
+            CHARGELAB_LOG_MESSAGE(warning) << "Error response to Authorize request: " << std::get<ocpp2_0::CallError> (rsp);
+        }
+    }
+
+    if (!found) {
+        CHARGELAB_LOG_MESSAGE(warning) << "Failed matching Authorize response against active Authorize requests";
+    }
+}
+
+void TransactionModule2_0::onTransactionEventRsp(
+        const std::string &unique_id,
+        const std::variant<ocpp2_0::TransactionEventResponse, ocpp2_0::CallError> &rsp
+) {
+    for (auto& entry : active_transactions_) {
+        if (!entry.second.has_value())
+            continue;
+        if (unique_id != entry.second->start_transaction_request_id)
+            continue;
+
+        if (std::holds_alternative<ocpp2_0::TransactionEventResponse>(rsp)) {
+            auto const &value = std::get<ocpp2_0::TransactionEventResponse>(rsp);
+            if (value.idTokenInfo.has_value()) {
+                switch (value.idTokenInfo->status) {
+                    case ocpp2_0::AuthorizationStatusEnumType::kAccepted:
+                        break;
+
+                    case ocpp2_0::AuthorizationStatusEnumType::kValueNotFoundInEnum:
+                    case ocpp2_0::AuthorizationStatusEnumType::kBlocked:
+                    case ocpp2_0::AuthorizationStatusEnumType::kConcurrentTx:
+                    case ocpp2_0::AuthorizationStatusEnumType::kExpired:
+                    case ocpp2_0::AuthorizationStatusEnumType::kInvalid:
+                    case ocpp2_0::AuthorizationStatusEnumType::kNoCredit:
+                    case ocpp2_0::AuthorizationStatusEnumType::kNotAllowedTypeEVSE:
+                    case ocpp2_0::AuthorizationStatusEnumType::kNotAtThisLocation:
+                    case ocpp2_0::AuthorizationStatusEnumType::kNotAtThisTime:
+                    case ocpp2_0::AuthorizationStatusEnumType::kUnknown:
+                        // TODO: Support MaxEnergyOnInvalidId?
+                        if (settings_->StopTransactionOnInvalidId.getValue()) {
+                            if (set::containsAny(
+                                    getStopPoints(),
+                                    ocpp2_0::TxStopPointValues::kAuthorized,
+                                    ocpp2_0::TxStopPointValues::kPowerPathClosed,
+                                    ocpp2_0::TxStopPointValues::kEnergyTransfer
+                            )) {
+                                // C15.FR.04
+                                CHARGELAB_LOG_MESSAGE(info) << "Stopping transaction (StopTransactionOnInvalidId) - transaction ID: " << entry.second->transaction_id;
+                                stopTransaction(
+                                        entry.first,
+                                        ocpp2_0::TriggerReasonEnumType::kDeauthorized,
+                                        ocpp2_0::ReasonEnumType::kDeAuthorized,
+                                        std::nullopt
+                                );
+                            } else {
+                                // C15.FR.03
+                                deauthorizeTransaction(
+                                        entry.first,
+                                        entry.second.value(),
+                                        ocpp2_0::TriggerReasonEnumType::kDeauthorized
+                                );
+                            }
+                        } else {
+                            if (set::containsAny(getStopPoints(), ocpp2_0::TxStopPointValues::kEnergyTransfer)) {
+                                CHARGELAB_LOG_MESSAGE(info) << "Stopping transaction (EnergyTransfer) - transaction ID: " << entry.second->transaction_id;
+                                stopTransaction(
+                                        entry.first,
+                                        ocpp2_0::TriggerReasonEnumType::kDeauthorized,
+                                        ocpp2_0::ReasonEnumType::kDeAuthorized,
+                                        std::nullopt
+                                );
+                            } else {
+                                // C15.FR.03
+                                deauthorizeTransaction(
+                                        entry.first,
+                                        entry.second.value(),
+                                        ocpp2_0::TriggerReasonEnumType::kChargingStateChanged
+                                );
+                            }
+                        }
+                        break;
+                }
+            }
+        } else {
+            CHARGELAB_LOG_MESSAGE(warning) << "Error response to StartTransaction request: " << std::get<ocpp2_0::CallError>(rsp);
+        }
+    }
+}
+
+std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::RequestStopTransactionResponse>>
+TransactionModule2_0::onRequestStopTransactionReq(const ocpp2_0::RequestStopTransactionRequest &req) {
+    for (auto& entry : active_transactions_) {
+        if (!entry.second.has_value())
+            continue;
+        if (!string::EqualsIgnoreCaseAscii(std::to_string(entry.second->transaction_id), req.transactionId.value()))
+            continue;
+
+        CHARGELAB_LOG_MESSAGE(info) << "Stopping transaction (RequestStopTransactionReq) - transaction ID: " << entry.second->transaction_id;
+        stopTransaction(
+                entry.first,
+                ocpp2_0::TriggerReasonEnumType::kRemoteStop,
+                ocpp2_0::ReasonEnumType::kRemote,
+                std::nullopt
+        );
+        return ocpp2_0::RequestStopTransactionResponse {ocpp2_0::RequestStartStopStatusEnumType::kAccepted};
+    }
+
+    if (settings_->StopTransactionWithDifferentId.getValue()) {
+        return ocpp2_0::RequestStopTransactionResponse{ocpp2_0::RequestStartStopStatusEnumType::kAccepted};
+    }
+
+    return ocpp2_0::RequestStopTransactionResponse {ocpp2_0::RequestStartStopStatusEnumType::kRejected};
+}
+
+std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::TriggerMessageResponse>>
+TransactionModule2_0::onTriggerMessageReq(const ocpp2_0::TriggerMessageRequest &req) {
+    if (req.requestedMessage == ocpp2_0::MessageTriggerEnumType::kMeterValues) {
+        return ocpp2_0::TriggerMessageResponse {ocpp2_0::TriggerMessageStatusEnumType::kRejected};
+    } else if (req.requestedMessage == ocpp2_0::MessageTriggerEnumType::kTransactionEvent) {
+        for (auto& entry : active_transactions_) {
+            if (!entry.first.has_value() || !entry.second.has_value())
+                continue;
+
+            // F06.FR.11
+            if (req.evse.has_value()) {
+                if (req.evse->id != entry.first->id)
+                    continue;
+                if (req.evse->connectorId.has_value() && req.evse->connectorId != entry.first->connectorId)
+                    continue;
+            }
+
+            addSampledReading(
+                    platform_->systemClockNow(),
+                    entry.first,
+                    entry.second.value(),
+                    ocpp2_0::TriggerReasonEnumType::kTrigger,
+                    ocpp2_0::ReadingContextEnumType::kTrigger,
+                    // F06.FR.07
+                    settings_->MeterValuesSampledData.getValue()
+            );
+
+            return ocpp2_0::TriggerMessageResponse {ocpp2_0::TriggerMessageStatusEnumType::kAccepted};
+        }
+
+        CHARGELAB_LOG_MESSAGE(error) << "Transaction not found";
+        return ocpp2_0::TriggerMessageResponse {ocpp2_0::TriggerMessageStatusEnumType::kRejected};
+    } else {
+        return std::nullopt;
+    }
+}
+
+std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::GetTransactionStatusResponse>>
+TransactionModule2_0::onGetTransactionStatusReq(const ocpp2_0::GetTransactionStatusRequest &request) {
+    ocpp2_0::GetTransactionStatusResponse response;
+    // E14.FR.06 - ongoing indicator is only set if transactionId is present
+    if (request.transactionId.has_value()) {
+        response.ongoingIndicator = false;
+
+        for (auto const &x: active_transactions_) {
+            if (!x.second.has_value())
+                continue;
+
+            auto const id = ocpp2_0::IdentifierStringPrimitive<36>{std::to_string(x.second->transaction_id)};
+            if (request.transactionId.value() != id)
+                continue;
+
+            response.ongoingIndicator = true;
+        }
+    }
+
+    pending_messages_module_->visitPending([&](PendingMessagePolicy const& policy, std::string const&) {
+        if (policy.message_type != PendingMessageType::kTransactionEvent)
+            return;
+
+        if (request.transactionId.has_value()) {
+            if (!policy.group_id.has_value())
+                return;
+
+            auto const id = ocpp2_0::IdentifierStringPrimitive<36> {std::to_string(policy.group_id.value())};
+            if (request.transactionId.value() != id)
+                return;
+        }
+
+        response.messagesInQueue = true;
+    });
+
+    return response;
+}
+
+chargelab::transaction_module2_0::TransactionContainer& TransactionModule2_0::startTransaction(
+        std::optional<ocpp2_0::EVSEType> evse,
+        std::optional<ocpp2_0::IdTokenType> const& id_token,
+        std::optional<ocpp2_0::IdTokenType> const& group_id_token,
+        ocpp2_0::TriggerReasonEnumType const& trigger_reason,
+        bool authorized,
+        SystemTimeMillis timestamp,
+        std::optional<std::vector<ocpp2_0::SampledValueType>> original_meter_values,
+        std::optional<std::vector<ocpp2_0::MeterValueType>> meter_values,
+        std::optional<ocpp2_0::ChargingProfileType> const& charging_profile,
+        std::optional<int> const& remote_start_id
+) {
+    auto const clock_fragment = static_cast<uint64_t>(static_cast<uint32_t>(platform_->systemClockNow()));
+    auto const random_fragment = static_cast<uint64_t>(static_cast<uint32_t>(unique_index_++));
+    auto const transaction_id = (clock_fragment << sizeof(uint32_t)*CHAR_BIT) | random_fragment;
+
+    auto const now = platform_->systemClockNow();
+    auto aligned_interval_sample = settings_->ClockAlignedDataInterval.getValue() * 1000;
+    if (aligned_interval_sample <= 0)
+        aligned_interval_sample = kMillisecondsInDay;
+
+    auto aligned_interval_ended = settings_->AlignedDataTxEndedInterval.getValue() * 1000;
+    if (aligned_interval_ended <= 0)
+        aligned_interval_ended = kMillisecondsInDay;
+
+    auto& active = active_transactions_[evse] = chargelab::transaction_module2_0::TransactionContainer {
+        transaction_id,
+        platform_->steadyClockNow(),
+        id_token,
+        group_id_token,
+        "",
+        charging_profile,
+        authorized,
+        false,
+        trigger_reason == ocpp2_0::TriggerReasonEnumType::kCablePluggedIn ? true : false,
+        floorToSecond(now),
+        floorToSecond(now),
+        static_cast<SystemTimeMillis> ((now/aligned_interval_sample)*aligned_interval_sample),
+        static_cast<SystemTimeMillis> ((now/aligned_interval_ended)*aligned_interval_ended)
+    };
+
+    active->start_transaction_request_id = pending_messages_module_->sendRequest2_0(
+            ocpp2_0::TransactionEventRequest {
+                    ocpp2_0::TransactionEventEnumType::kStarted,
+                    timestamp,
+                    trigger_reason,
+                    0,
+                    !isWebsocketConnected(),
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt,
+                    ocpp2_0::TransactionType {
+                            std::to_string(active->transaction_id),
+                            active->last_charging_status = getChargingState(evse, active.value()),
+                            std::nullopt,
+                            std::nullopt,
+                            remote_start_id
+                    },
+                    active->id_token,
+                    evse,
+                    std::move(meter_values),
+
+            },
+            PendingMessagePolicy {
+                    PendingMessageType::kTransactionEvent,
+                    transaction_id,
+                    settings_->TransactionMessageAttempts.getValue(),
+                    settings_->TransactionMessageRetryInterval.getValue(),
+                    kPriorityStartTransaction,
+                    false,
+                    true,
+                    true
+            }
+    );
+
+    if (transaction_listener_ != nullptr) {
+        transaction_listener_->onTransactionUpdate(
+            chargelab::TransactionListener2_0::Status::kStarted,
+            evse,
+            active_transactions_[evse].value(),
+            station_->pollConnectorStatus(evse.value()),
+            original_meter_values);
+    }
+
+    return active.value();
+}
+
+bool TransactionModule2_0::updateTransaction(
+        std::optional<ocpp2_0::EVSEType> evse,
+        std::optional<ocpp2_0::IdTokenType> const& id_token,
+        std::optional<ocpp2_0::IdTokenType> const& group_id_token,
+        ocpp2_0::TriggerReasonEnumType const& trigger_reason,
+        SystemTimeMillis timestamp,
+        std::optional<std::vector<ocpp2_0::MeterValueType>> meter_values
+) {
+    auto& active = active_transactions_[evse];
+    if (!active.has_value())
+        return false;
+
+    if (id_token.has_value())
+        active->id_token = id_token;
+    if (group_id_token.has_value())
+        active->group_id_token = group_id_token;
+
+    pending_messages_module_->sendRequest2_0(
+            ocpp2_0::TransactionEventRequest {
+                    ocpp2_0::TransactionEventEnumType::kUpdated,
+                    timestamp,
+                    trigger_reason,
+                    0,
+                    !isWebsocketConnected(),
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt,
+                    ocpp2_0::TransactionType {
+                            std::to_string(active->transaction_id),
+                            active->last_charging_status = getChargingState(evse, active.value())
+                    },
+                    id_token,
+                    evse,
+                    std::move(meter_values)
+            },
+            PendingMessagePolicy {
+                    PendingMessageType::kTransactionEvent,
+                    active->transaction_id,
+                    settings_->TransactionMessageAttempts.getValue(),
+                    settings_->TransactionMessageRetryInterval.getValue(),
+                    kPriorityStartTransaction,
+                    false,
+                    true
+            }
+    );
+    return true;
+}
+
+detail::PendingMessageWrapper TransactionModule2_0::generateStopRequest(
+        chargelab::transaction_module2_0::TransactionContainer const& transaction,
+        std::optional<ocpp2_0::EVSEType> const& evse,
+        ocpp2_0::TriggerReasonEnumType const& trigger_reason,
+        ocpp2_0::ReasonEnumType const& stopped_reason,
+        std::optional<ocpp2_0::IdTokenType> id_token
+) {
+    std::optional<ocpp2_0::ChargingStateEnumType> last_charging_status = std::nullopt;
+    if (evse.has_value()) {
+        auto const& status = station_->pollConnectorStatus(evse.value());
+        if (status.has_value() && status->vehicle_connected) {
+            last_charging_status = ocpp2_0::ChargingStateEnumType::kEVConnected;
+        } else {
+            last_charging_status = ocpp2_0::ChargingStateEnumType::kIdle;
+        }
+    }
+
+    auto const now = floorToSecond(platform_->systemClockNow());
+    std::optional<std::vector<ocpp2_0::MeterValueType>> meter_values = transaction.ended_meter_values;
+
+    auto const final_values = getMeterValues(
+            evse,
+            ocpp2_0::ReadingContextEnumType::kTransaction_End,
+            settings_->StopTxnSampledData.getValue(),
+            now
+    );
+    if (final_values.filtered.has_value()) {
+        for (auto const &x : final_values.filtered.value())
+            meter_values->push_back(x);
+    }
+
+    if (meter_values->empty())
+        meter_values = std::nullopt;
+
+    auto pending_message = pending_messages_module_->generateRequest2_0(
+            ocpp2_0::TransactionEventRequest {
+                    ocpp2_0::TransactionEventEnumType::kEnded,
+                    now,
+                    trigger_reason,
+                    0,
+                    !isWebsocketConnected(),
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt,
+                    ocpp2_0::TransactionType {
+                            std::to_string(transaction.transaction_id),
+                            last_charging_status,
+                            std::nullopt,
+                            stopped_reason
+                    },
+                    std::move(id_token),
+                    evse,
+                    std::move(meter_values)
+            },
+            PendingMessagePolicy {
+                    PendingMessageType::kTransactionEvent,
+                    transaction.transaction_id,
+                    settings_->TransactionMessageAttempts.getValue(),
+                    settings_->TransactionMessageRetryInterval.getValue(),
+                    kPriorityStopTransaction,
+                    false,
+                    true,
+                    true
+            }
+    );
+
+    if (transaction_listener_ != nullptr) {
+        transaction_listener_->onTransactionUpdate(
+            chargelab::TransactionListener2_0::Status::kPersistedStopCheckpoint,
+            evse,
+            active_transactions_[evse].value(),
+            station_->pollConnectorStatus(evse.value()),
+            final_values.original);
+    }
+
+    return pending_message;
+}
+
+void TransactionModule2_0::stopTransaction(
+        std::optional<ocpp2_0::EVSEType> const& evse,
+        ocpp2_0::TriggerReasonEnumType const& trigger_reason,
+        ocpp2_0::ReasonEnumType const& stopped_reason,
+        std::optional<ocpp2_0::IdTokenType> id_token
+) {
+    auto& active = active_transactions_[evse];
+    if (!active.has_value())
+        return;
+
+    if (evse.has_value()) {
+        station_->setChargingEnabled(evse.value(), false);
+
+        auto const& status = station_->pollConnectorStatus(evse.value());
+        if (status.has_value() && status->vehicle_connected) {
+            active->last_charging_status = ocpp2_0::ChargingStateEnumType::kEVConnected;
+        } else {
+            active->last_charging_status = ocpp2_0::ChargingStateEnumType::kIdle;
+        }
+
+        power_management_module_->onActiveTransactionFinished(evse->id);
+    }
+
+    auto const now = floorToSecond(platform_->systemClockNow());
+    std::optional<std::vector<ocpp2_0::MeterValueType>> meter_values = std::move(active->ended_meter_values);
+
+    auto const final_values = getMeterValues(
+            evse,
+            ocpp2_0::ReadingContextEnumType::kTransaction_End,
+            settings_->StopTxnSampledData.getValue(),
+            now
+    );
+    if (final_values.filtered.has_value()) {
+        for (auto const &x : final_values.filtered.value())
+            meter_values->push_back(x);
+    }
+
+    if (meter_values->empty())
+        meter_values = std::nullopt;
+
+    pending_messages_module_->sendRequest2_0(
+            ocpp2_0::TransactionEventRequest {
+                    ocpp2_0::TransactionEventEnumType::kEnded,
+                    now,
+                    trigger_reason,
+                    0,
+                    !isWebsocketConnected(),
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt,
+                    ocpp2_0::TransactionType {
+                        std::to_string(active->transaction_id),
+                        active->last_charging_status,
+                        std::nullopt,
+                        stopped_reason
+                    },
+                    std::move(id_token),
+                    evse,
+                    std::move(meter_values)
+            },
+            PendingMessagePolicy {
+                    PendingMessageType::kTransactionEvent,
+                    active->transaction_id,
+                    settings_->TransactionMessageAttempts.getValue(),
+                    settings_->TransactionMessageRetryInterval.getValue(),
+                    kPriorityStopTransaction,
+                    false,
+                    true,
+                    true
+            }
+    );
+    active = std::nullopt;
+
+    if (transaction_listener_ != nullptr) {
+        transaction_listener_->onTransactionUpdate(
+            chargelab::TransactionListener2_0::Status::kStopped,
+            evse,
+            active_transactions_[evse].value(),
+            station_->pollConnectorStatus(evse.value()),
+            final_values.original);
+    }
+}
+
+void TransactionModule2_0::processRfidTap(ocpp2_0::IdTokenType const& id_token) {
+    if (stopByIdTag(id_token))
+        return;
+
+    pending_start_req_[std::nullopt] = transaction_module2_0::PendingStartRequest{platform_, std::nullopt, id_token};
+}
+
+bool TransactionModule2_0::stopByIdTag(ocpp2_0::IdTokenType id_token) {
+    for (auto& x : active_transactions_) {
+        if (!x.second.has_value() || !x.second->id_token.has_value())
+            continue;
+
+        auto const value = x.second->id_token.value();
+        if (value.type == id_token.type && value.idToken == id_token.idToken) {
+            auto const& stop_points = getStopPoints();
+            if (set::containsAny(stop_points, ocpp2_0::TxStopPointValues::kAuthorized, ocpp2_0::TxStopPointValues::kPowerPathClosed)) {
+                CHARGELAB_LOG_MESSAGE(info) << "Stopping transaction (RFID) - transaction ID: " << x.second->transaction_id;
+                stopTransaction(
+                        x.first,
+                        ocpp2_0::TriggerReasonEnumType::kStopAuthorized,
+                        ocpp2_0::ReasonEnumType::kLocal,
+                        id_token
+                );
+            } else {
+                deauthorizeTransaction(
+                        x.first,
+                        x.second.value(),
+                        ocpp2_0::TriggerReasonEnumType::kStopAuthorized
+                );
+            }
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void TransactionModule2_0::deauthorizeTransaction(
+        std::optional<ocpp2_0::EVSEType> evse_id,
+        chargelab::transaction_module2_0::TransactionContainer& transaction,
+        ocpp2_0::TriggerReasonEnumType trigger_reason
+) {
+    if (evse_id.has_value()) {
+        station_->setChargingEnabled(evse_id.value(), false);
+    }
+
+    transaction.deauthorized = true;
+    updateTransaction(
+            evse_id,
+            std::nullopt,
+            std::nullopt,
+            trigger_reason,
+            platform_->systemClockNow()
+    );
+}
+
+bool TransactionModule2_0::stopByGroupId(ocpp2_0::IdTokenType id_token, std::optional<ocpp2_0::IdTokenType> const& group_id) {
+    if (!group_id.has_value())
+        return false;
+
+    for (auto& x : active_transactions_) {
+        if (!x.second.has_value() || !x.second->group_id_token.has_value())
+            continue;
+
+        auto const value = x.second->group_id_token.value();
+        if (value.type == group_id->type && value.idToken == group_id->idToken) {
+            auto const& stop_points = getStopPoints();
+            if (set::containsAny(stop_points, ocpp2_0::TxStopPointValues::kAuthorized, ocpp2_0::TxStopPointValues::kPowerPathClosed)) {
+                CHARGELAB_LOG_MESSAGE(info) << "Stopping transaction (group ID) - transaction ID: "
+                                            << x.second->transaction_id;
+                stopTransaction(
+                        x.first,
+                        ocpp2_0::TriggerReasonEnumType::kStopAuthorized,
+                        ocpp2_0::ReasonEnumType::kLocal,
+                        id_token
+                );
+            } else {
+                deauthorizeTransaction(
+                        x.first,
+                        x.second.value(),
+                        ocpp2_0::TriggerReasonEnumType::kDeauthorized
+                );
+            }
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void TransactionModule2_0::processVehicleConnectedStateChanged(ocpp2_0::EVSEType const& evse, bool connected) {
+    assert(evse.connectorId.has_value());
+    CHARGELAB_LOG_MESSAGE(info) << "Connector state changed (" << evse << "): connected=" << connected;
+    CHARGELAB_LOG_MESSAGE(info) << "Running transaction on connector: " << active_transactions_[evse].has_value();
+
+    if (active_transactions_[evse].has_value()) {
+        if (!connected) {
+            if (set::containsAny(getStopPoints(), ocpp2_0::TxStopPointValues::kEVConnected, ocpp2_0::TxStopPointValues::kPowerPathClosed)) {
+                CHARGELAB_LOG_MESSAGE(info) << "Stopping transaction (EVConnected|PowerPathClosed) - transaction ID: " << active_transactions_[evse]->transaction_id;
+                stopTransaction(
+                        evse,
+                        ocpp2_0::TriggerReasonEnumType::kEVCommunicationLost,
+                        ocpp2_0::ReasonEnumType::kEVDisconnected,
+                        std::nullopt
+                );
+            }
+        } else {
+            updateTransaction(
+                    evse,
+                    std::nullopt,
+                    std::nullopt,
+                    ocpp2_0::TriggerReasonEnumType::kEVCommunicationLost,
+                    platform_->systemClockNow()
+            );
+        }
+
+        return;
+    }
+
+    if (connected) {
+        for (auto& x : active_transactions_) {
+            if (!x.second.has_value())
+                continue;
+            if (!x.first.has_value())
+                continue;
+            if (x.first->connectorId.has_value())
+                continue;
+
+            auto const now = platform_->systemClockNow();
+            std::swap(active_transactions_[x.first], active_transactions_[evse]);
+            updateTransaction(
+                    evse,
+                    std::nullopt,
+                    std::nullopt,
+                    ocpp2_0::TriggerReasonEnumType::kCablePluggedIn,
+                    now,
+                    // E01.FR.17
+                    getMeterValues(
+                            evse,
+                            ocpp2_0::ReadingContextEnumType::kTransaction_Begin,
+                            settings_->SampledDataTxStartedMeasurands.getValue(),
+                            now
+                    ).filtered
+            );
+
+            if (active_transactions_[evse]->authorized)
+                return;
+        }
+
+        for (auto& x : active_transactions_) {
+            if (!x.second.has_value())
+                continue;
+            if (x.first.has_value())
+                continue;
+
+            auto const now = platform_->systemClockNow();
+            std::swap(active_transactions_[x.first], active_transactions_[evse]);
+            updateTransaction(
+                    evse,
+                    std::nullopt,
+                    std::nullopt,
+                    ocpp2_0::TriggerReasonEnumType::kCablePluggedIn,
+                    now,
+                    // E01.FR.17
+                    getMeterValues(
+                            evse,
+                            ocpp2_0::ReadingContextEnumType::kTransaction_Begin,
+                            settings_->SampledDataTxStartedMeasurands.getValue(),
+                            now
+                    ).filtered
+            );
+
+            if (active_transactions_[evse]->authorized)
+                return;
+        }
+
+        if (!connector_status_module_->getPendingReset()) {
+            auto const &start_points = getStartPoints();
+            if (set::contains(start_points, ocpp2_0::TxStartPointValues::kEVConnected)) {
+                auto const now = floorToSecond(platform_->systemClockNow());
+                auto const meter_values = getMeterValues(
+                            evse,
+                            ocpp2_0::ReadingContextEnumType::kTransaction_Begin,
+                            settings_->SampledDataTxStartedMeasurands.getValue(),
+                            now
+                    );
+                auto const& result = startTransaction(
+                        evse,
+                        std::nullopt,
+                        std::nullopt,
+                        ocpp2_0::TriggerReasonEnumType::kCablePluggedIn,
+                        false,
+                        now,
+                        meter_values.original,
+                        // E01.FR.09
+                        meter_values.filtered
+                );
+                CHARGELAB_LOG_MESSAGE(info) << "Started new transaction (EVConnected) - transaction ID: " << result.transaction_id;
+
+                if (active_transactions_[evse]->authorized)
+                    return;
+            }
+        }
+    }
+
+    auto plug_and_charge_id = settings_->PlugAndChargeId.getValue();
+    if (connected && !plug_and_charge_id.empty()) {
+        bool found = false;
+        for (auto const& x : pending_start_req_) {
+            if (!x.first.has_value()) {
+                found = true;
+                break;
+            }
+            if (x.first->id == evse.id) {
+                if (!x.first->connectorId.has_value()) {
+                    found = true;
+                    break;
+                }
+                if (x.first->connectorId.value() == evse.connectorId.value()) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if (found)
+            return;
+
+        pending_start_req_[evse] = transaction_module2_0::PendingStartRequest {
+                platform_,
+                evse,
+                ocpp2_0::IdTokenType {
+                        plug_and_charge_id,
+                        ocpp2_0::IdTokenEnumType::kLocal
+                }
+        };
+    }
+}
+
+void TransactionModule2_0::processChargingEnabledStateChanged(ocpp2_0::EVSEType const& evse, bool charging_enabled) {
+    assert(evse.connectorId.has_value());
+    CHARGELAB_LOG_MESSAGE(info) << "Charging enabled state changed (" << evse << "): charging_enabled=" << charging_enabled;
+
+    auto const& start_points = getStartPoints();
+    auto const& stop_points = getStopPoints();
+
+    if (charging_enabled) {
+        if (!set::contains(start_points, ocpp2_0::TxStartPointValues::kEnergyTransfer))
+            return;
+        if (active_transactions_[evse].has_value())
+            return;
+
+        auto const status = station_->pollConnectorStatus(evse);
+        if (!status.has_value() || !status->vehicle_connected)
+            return;
+
+        auto const now = floorToSecond(platform_->systemClockNow());
+        auto const meter_values = getMeterValues(
+                evse,
+                ocpp2_0::ReadingContextEnumType::kTransaction_Begin,
+                settings_->SampledDataTxStartedMeasurands.getValue(),
+                now
+        );
+        auto const& result = startTransaction(
+                evse,
+                std::nullopt,
+                std::nullopt,
+                ocpp2_0::TriggerReasonEnumType::kChargingStateChanged,
+                false,
+                now,
+                meter_values.original,
+                meter_values.filtered
+        );
+        CHARGELAB_LOG_MESSAGE(info) << "Started new transaction (EnergyTransfer) - transaction ID: " << result.transaction_id;
+    } else {
+        if (!set::contains(stop_points, ocpp2_0::TxStopPointValues::kEnergyTransfer))
+            return;
+        if (!active_transactions_[evse].has_value())
+            return;
+
+        auto const status = station_->pollConnectorStatus(evse);
+        if (!status.has_value() || !status->vehicle_connected)
+            return;
+
+        CHARGELAB_LOG_MESSAGE(info) << "Stopping transaction (EnergyTransfer stopped) - transaction ID: " << active_transactions_[evse]->transaction_id;
+        stopTransaction(
+                evse,
+                ocpp2_0::TriggerReasonEnumType::kChargingStateChanged,
+                ocpp2_0::ReasonEnumType::kStoppedByEV,
+                std::nullopt
+        );
+    }
+}
+
+void TransactionModule2_0::processPendingStartRequest(
+        ocpp2_0::OcppRemote& remote,
+        std::optional<transaction_module2_0::PendingStartRequest>& pending
+) {
+    if (!pending.has_value())
+        return;
+
+    auto const elapsed = platform_->steadyClockNow() - pending->created_timestamp;
+    if (elapsed >= settings_->ConnectionTimeOut.getValue()*1000) {
+        pending = std::nullopt;
+        return;
+    }
+
+    if (!pending->authorize_finished) {
+        if (treatAsConnected()) {
+            // F01.FR.01
+            if (!pending->pending_authorize_req.operationInProgress()) {
+                pending->pending_authorize_req.setWithTimeout(
+                        settings_->DefaultMessageTimeout.getValue(),
+                        remote.sendAuthorizeReq(ocpp2_0::AuthorizeRequest {
+                                std::nullopt,
+                                pending->id_token
+                        })
+                );
+            }
+
+            return;
+        } else if (!settings_->AllowOfflineTxForUnknownId.getValue()) {
+            return;
+        }
+    }
+
+    for (auto& active : active_transactions_) {
+        if (!active.second.has_value())
+            continue;
+        if (active.second->authorized)
+            continue;
+        if (pending->evse.has_value()) {
+            if (!active.first.has_value())
+                continue;
+            if (pending->evse->id != active.first->id)
+                continue;
+            if (pending->evse->connectorId.has_value() && pending->evse->connectorId != active.first->connectorId)
+                continue;
+        }
+
+        active.second->authorized = true;
+        updateTransaction(
+                active.first,
+                pending->id_token,
+                pending->group_id_token,
+                ocpp2_0::TriggerReasonEnumType::kAuthorized,
+                platform_->systemClockNow()
+        );
+        return;
+    }
+
+    if (connector_status_module_->getPendingReset())
+        return;
+
+    std::set<int> evse_ids_with_active_transactions;
+    for (auto const& x : active_transactions_) {
+        if (x.first.has_value() && x.second.has_value())
+            evse_ids_with_active_transactions.insert(x.first->id);
+    }
+
+    auto const start_points = getStartPoints();
+    for (auto const& entry : station_->getConnectorMetadata()) {
+        if (evse_ids_with_active_transactions.find(entry.first.id) != evse_ids_with_active_transactions.end())
+            continue;
+
+        auto const& status = station_->pollConnectorStatus(entry.first);
+        if (!status.has_value() || !status->vehicle_connected)
+            continue;
+        if (pending->evse.has_value()) {
+            if (pending->evse->id != entry.first.id)
+                continue;
+            if (pending->evse->connectorId.has_value() && pending->evse->connectorId.value() != entry.first.connectorId.value())
+                continue;
+        }
+
+        if (set::contains(start_points, ocpp2_0::TxStartPointValues::kPowerPathClosed)) {
+            ocpp2_0::TriggerReasonEnumType start_reason;
+            if (pending->remote_start_id.has_value()) {
+                // F02.FR.21
+                start_reason = ocpp2_0::TriggerReasonEnumType::kRemoteStart;
+            } else {
+                start_reason = ocpp2_0::TriggerReasonEnumType::kCablePluggedIn;
+            }
+
+            auto const now = floorToSecond(platform_->systemClockNow());
+            auto const meter_values = getMeterValues(
+                            entry.first,
+                            ocpp2_0::ReadingContextEnumType::kTransaction_Begin,
+                            settings_->SampledDataTxStartedMeasurands.getValue(),
+                            now
+                    );
+            auto const& result = startTransaction(
+                    entry.first,
+                    pending->id_token,
+                    pending->group_id_token,
+                    start_reason,
+                    true,
+                    now,
+                    meter_values.original,
+                    // E01.FR.09
+                    meter_values.filtered,
+                    pending->charging_profile,
+                    pending->remote_start_id
+            );
+            CHARGELAB_LOG_MESSAGE(info) << "Started new transaction (PowerPathClosed) - transaction ID: " << result.transaction_id;
+            pending = std::nullopt;
+            return;
+        } else if (set::contains(start_points, ocpp2_0::TxStartPointValues::kAuthorized)) {
+            // E01.FR.16
+            ocpp2_0::TriggerReasonEnumType start_reason;
+            if (pending->remote_start_id.has_value()) {
+                // F02.FR.21
+                start_reason = ocpp2_0::TriggerReasonEnumType::kRemoteStart;
+            } else {
+                start_reason = ocpp2_0::TriggerReasonEnumType::kAuthorized;
+            }
+
+            auto const now = floorToSecond(platform_->systemClockNow());
+            auto const meter_values = getMeterValues(
+                            entry.first,
+                            ocpp2_0::ReadingContextEnumType::kTransaction_Begin,
+                            settings_->SampledDataTxStartedMeasurands.getValue(),
+                            now
+                    );
+            auto const& result = startTransaction(
+                    entry.first,
+                    pending->id_token,
+                    pending->group_id_token,
+                    start_reason,
+                    true,
+                    now,
+                    meter_values.original,
+                    meter_values.filtered,
+                    pending->charging_profile,
+                    pending->remote_start_id
+            );
+            CHARGELAB_LOG_MESSAGE(info) << "Started new transaction (Authorized with connector) - transaction ID: " << result.transaction_id;
+            pending = std::nullopt;
+            return;
+        }
+    }
+
+    if (set::contains(start_points, ocpp2_0::TxStartPointValues::kAuthorized)) {
+        ocpp2_0::TriggerReasonEnumType start_reason;
+        if (pending->remote_start_id.has_value()) {
+            // F02.FR.21
+            start_reason = ocpp2_0::TriggerReasonEnumType::kRemoteStart;
+        } else {
+            start_reason = ocpp2_0::TriggerReasonEnumType::kAuthorized;
+        }
+
+        auto const now = floorToSecond(platform_->systemClockNow());
+        auto const& result = startTransaction(
+                pending->evse,
+                pending->id_token,
+                pending->group_id_token,
+                start_reason,
+                true,
+                now,
+                std::nullopt,
+                std::nullopt,
+                pending->charging_profile,
+                pending->remote_start_id
+        );
+        CHARGELAB_LOG_MESSAGE(info) << "Started new transaction (Authorized without connector) - transaction ID: " << result.transaction_id;
+        pending = std::nullopt;
+        return;
+    }
+}
+
+void TransactionModule2_0::addSampledReading(
+        SystemTimeMillis now,
+        std::optional<ocpp2_0::EVSEType> const& evse,
+        chargelab::transaction_module2_0::TransactionContainer& entry,
+        ocpp2_0::TriggerReasonEnumType const& trigger_reason,
+        ocpp2_0::ReadingContextEnumType const& context,
+        std::string const& measurands
+) {
+    if (!evse.has_value()) {
+        CHARGELAB_LOG_MESSAGE(error) << "Failed adding reading - no associated evse";
+        return;
+    }
+
+    pending_messages_module_->sendRequest2_0(
+            ocpp2_0::TransactionEventRequest {
+                    ocpp2_0::TransactionEventEnumType::kUpdated,
+                    now,
+                    trigger_reason,
+                    0,
+                    !isWebsocketConnected(),
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt,
+                    ocpp2_0::TransactionType {
+                            std::to_string(entry.transaction_id),
+                            entry.last_charging_status = getChargingState(evse, entry)
+                    },
+                    std::nullopt,
+                    evse,
+                    getMeterValues(evse, context, measurands, now).filtered
+            },
+            PendingMessagePolicy {
+                    PendingMessageType::kTransactionEvent,
+                    entry.transaction_id,
+                    settings_->TransactionMessageAttempts.getValue(),
+                    settings_->TransactionMessageRetryInterval.getValue(),
+                    kPriorityMeterValue,
+                    false,
+                    true
+            }
+    );
+}
+
+void TransactionModule2_0::addEndedReading(
+        SystemTimeMillis now,
+        std::optional<ocpp2_0::EVSEType> const& evse,
+        chargelab::transaction_module2_0::TransactionContainer& entry,
+        ocpp2_0::ReadingContextEnumType const& context,
+        std::string const& measurands
+) {
+    auto const meter_values = getMeterValues(evse, context, measurands, now).filtered;
+    if (!meter_values.has_value())
+        return;
+
+    for (auto const& x : meter_values.value())
+        entry.ended_meter_values.push_back(x);
+
+    std::size_t total_size;
+    while (true) {
+        total_size = sizeof(entry.ended_meter_values);
+        for (auto const& meter_value : entry.ended_meter_values) {
+            total_size += sizeof(meter_value);
+            for (auto const &sampled_value: meter_value.sampledValue)
+                total_size += sizeof(sampled_value);
+        }
+
+        if ((int)total_size <= settings_->MaxTransactionEndedMeterValuesBytes.getValue())
+            break;
+
+        std::uniform_int_distribution<int64_t> distribution(0, entry.ended_meter_values.size() - 1);
+        auto const it = entry.ended_meter_values.begin() + distribution(random_engine_);
+        CHARGELAB_LOG_MESSAGE(info) << "Dropping ended MeterValue - MaxTransactionEndedMeterValuesBytes limit exceeded: " << *it;
+        entry.ended_meter_values.erase(it);
+    }
+
+    CHARGELAB_LOG_MESSAGE(debug) << "Total ended meter values size: " << total_size << " bytes";
+}
+
+bool TransactionModule2_0::shouldTakeReading(SystemTimeMillis& last, int interval_seconds) {
+    if (interval_seconds <= 0)
+        return false;
+
+    auto const now = platform_->systemClockNow();
+    auto const delta_seconds = (now - last)/1000;
+    if (delta_seconds < 0) {
+        if (delta_seconds >= -kClockDriftThresholdSeconds)
+            return false;
+
+        CHARGELAB_LOG_MESSAGE(warning) << "Negative elapsed interval - taking reading: " << delta_seconds;
+    }
+
+    SystemTimeMillis ts;
+    if (delta_seconds < 0) {
+        auto const intervals = -delta_seconds/interval_seconds;
+        ts = static_cast<SystemTimeMillis>(last - (intervals+1)*interval_seconds*1000);
+    } else {
+        auto const intervals = delta_seconds/interval_seconds;
+        ts = static_cast<SystemTimeMillis>(last + intervals*interval_seconds*1000);
+    }
+
+    if (last == ts)
+        return false;
+
+    last = ts;
+    return true;
+}
+
+ocpp2_0::ChargingStateEnumType TransactionModule2_0::getChargingState(
+        std::optional<ocpp2_0::EVSEType> evse_id,
+        chargelab::transaction_module2_0::TransactionContainer& transaction
+) {
+    if (!evse_id.has_value())
+        return ocpp2_0::ChargingStateEnumType::kIdle;
+
+    auto const& status = station_->pollConnectorStatus(evse_id.value());
+    if (!status.has_value())
+        return ocpp2_0::ChargingStateEnumType::kIdle;
+    if (!status->vehicle_connected)
+        return ocpp2_0::ChargingStateEnumType::kIdle;
+    if (!transaction.authorized || transaction.deauthorized)
+        return ocpp2_0::ChargingStateEnumType::kEVConnected;
+
+    if (!status->charging_enabled)
+        return ocpp2_0::ChargingStateEnumType::kEVConnected;
+
+    if (status->suspended_by_charger)
+        return ocpp2_0::ChargingStateEnumType::kSuspendedEVSE;
+    if (status->suspended_by_vehicle)
+        return ocpp2_0::ChargingStateEnumType::kSuspendedEV;
+
+    return ocpp2_0::ChargingStateEnumType::kCharging;
+}
+
+bool TransactionModule2_0::treatAsConnected() {
+    if (!boot_notification_module_->registrationComplete())
+        return false;
+
+    auto const websocket = platform_->ocppConnection();
+    if (websocket == nullptr)
+        return false;
+
+    return websocket->isConnected();
+}
+
+bool TransactionModule2_0::isWebsocketConnected() {
+    auto const websocket = platform_->ocppConnection();
+    if (websocket == nullptr)
+        return false;
+
+    return websocket->isConnected();
+}
+
+transaction_module2_0::MeterValuesResult TransactionModule2_0::getMeterValues(
+        std::optional<ocpp2_0::EVSEType> const& evse,
+        ocpp2_0::ReadingContextEnumType const& context,
+        std::string const& measurands,
+        SystemTimeMillis now
+) {
+    if (!evse.has_value() || measurands.empty())
+        return {};
+
+    auto enabled = parseMeasurandsString(measurands);
+    auto sampled_values = station_->pollMeterValues2_0(evse.value());
+    auto original_values = sampled_values;
+    for (auto& value : original_values)
+        value.context = context;
+
+    sampled_values.erase(
+        std::remove_if(
+            sampled_values.begin(),
+            sampled_values.end(),
+            [&](ocpp2_0::SampledValueType const& value) {
+                auto measurand = value.measurand.value_or(ocpp2_0::MeasurandEnumType::kEnergy_Active_Import_Register);
+                return enabled.find(measurand) == enabled.end();
+            }
+        ),
+        sampled_values.end()
+    );
+
+    if (sampled_values.empty())
+        return { original_values.empty() ? std::nullopt : std::make_optional(std::move(original_values)), std::nullopt };
+
+    for (auto& value : sampled_values)
+        value.context = context;
+
+    return {
+        original_values.empty() ? std::nullopt : std::make_optional(std::move(original_values)),
+        std::vector<ocpp2_0::MeterValueType> {
+            ocpp2_0::MeterValueType { now, std::move(sampled_values) }
+        }
+    };
+}
+
+std::set<ocpp2_0::TxStartPointValues> TransactionModule2_0::getStartPoints() {
+    std::set<ocpp2_0::TxStartPointValues> result;
+    string::SplitVisitor(settings_->TxStartPoint.getValue(), ",", [&](std::string const& value) {
+        auto value_as_enum = ocpp2_0::TxStartPointValues::from_string(value);
+        if (value_as_enum == ocpp2_0::TxStartPointValues::kValueNotFoundInEnum) {
+            CHARGELAB_LOG_MESSAGE(error) << "Unexpected start point: " << value;
+        } else {
+            result.insert(value_as_enum);
+        }
+    });
+
+    return result;
+}
+
+std::set<ocpp2_0::TxStopPointValues> TransactionModule2_0::getStopPoints() {
+    std::set<ocpp2_0::TxStopPointValues> result;
+    string::SplitVisitor(settings_->TxStopPoint.getValue(), ",", [&](std::string const& value) {
+        auto value_as_enum = ocpp2_0::TxStopPointValues::from_string(value);
+        if (value_as_enum == ocpp2_0::TxStopPointValues::kValueNotFoundInEnum) {
+            CHARGELAB_LOG_MESSAGE(error) << "Unexpected start point: " << value;
+        } else {
+            result.insert(value_as_enum);
+        }
+    });
+
+    return result;
+}
+
+std::unordered_set<ocpp2_0::MeasurandEnumType::Value> TransactionModule2_0::parseMeasurandsString(std::string const& measurands) {
+    std::unordered_set<ocpp2_0::MeasurandEnumType::Value> ret;
+    string::SplitVisitor(measurands, ",", [&](std::string const& value) {
+        auto value_as_enum = ocpp2_0::MeasurandEnumType::from_string(value);
+        if (value_as_enum == ocpp2_0::MeasurandEnumType::kValueNotFoundInEnum) {
+            CHARGELAB_LOG_MESSAGE(error) << "Unexpected measurand: " << value;
+        } else {
+            ret.insert(value_as_enum);
+        }
+    });
+
+    return ret;
+}
+
+SystemTimeMillis TransactionModule2_0::floorToSecond(SystemTimeMillis ts) {
+    return static_cast<SystemTimeMillis>((ts/1000)*1000);
+}
+
+} // namespace chargelab
