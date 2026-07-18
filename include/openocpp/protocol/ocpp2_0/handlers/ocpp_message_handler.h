@@ -64,8 +64,10 @@ namespace chargelab::ocpp2_0 {
             }
 
             auto const subprotocol = websocket->getSubprotocol();
-            if (!subprotocol.has_value() || !string::EqualsIgnoreCaseAscii(subprotocol.value(), "ocpp2.0.1")) {
-                CHARGELAB_LOG_MESSAGE(trace) << "Skipping OCPP 2.0.1 message handler based on websocket subprotocol: " << subprotocol;
+            if (!subprotocol.has_value() ||
+                (!string::EqualsIgnoreCaseAscii(subprotocol.value(), "ocpp2.0.1") &&
+                 !string::EqualsIgnoreCaseAscii(subprotocol.value(), "ocpp2.1"))) {
+                CHARGELAB_LOG_MESSAGE(trace) << "Skipping OCPP 2.0.1/2.1 message handler based on websocket subprotocol: " << subprotocol;
                 return;
             }
 
@@ -415,6 +417,55 @@ namespace chargelab::ocpp2_0 {
 
                         return;
                     }
+
+                case MessageType::kCallResultError:
+                    {
+                        std::string unique_id;
+                        if (!json::ReadValue<std::string>::read_json(reader, unique_id)) {
+                            CHARGELAB_LOG_MESSAGE(warning) << "Bad message payload - missing or bad unique ID: " << message;
+                            dispatchUnexpectedMessage(message);
+                            return;
+                        }
+
+                        ErrorCode error_code;
+                        if (!json::ReadValue<ErrorCode>::read_json(reader, error_code)) {
+                            CHARGELAB_LOG_MESSAGE(warning) << "Bad message payload - missing or bad error code: " << message;
+                            dispatchUnexpectedMessage(message);
+                            return;
+                        }
+
+                        std::string description;
+                        if (!json::ReadValue<std::string>::read_json(reader, description)) {
+                            CHARGELAB_LOG_MESSAGE(warning) << "Bad message payload - missing or bad description: " << message;
+                            dispatchUnexpectedMessage(message);
+                            return;
+                        }
+
+                        common::RawJson details;
+                        if (!json::ReadValue<common::RawJson>::read_json(reader, details)) {
+                            CHARGELAB_LOG_MESSAGE(warning) << "Bad message payload - missing or bad details: " << message;
+                            dispatchUnexpectedMessage(message);
+                            return;
+                        }
+
+                        // Note: ignoring and allowing
+                        if (!json::expect_type<json::EndArrayType>(reader))
+                            CHARGELAB_LOG_MESSAGE(warning) << "Unexpected elements in OCPP call: " << message;
+
+                        auto const error = CallError {error_code, description, details};
+                        CHARGELAB_LOG_MESSAGE(debug) << "Received OCPP call result error: id=" << unique_id << ", error=" << error;
+
+                        // A CALLRESULTERROR is a reply to a CALLRESULT we sent (in response to an inbound
+                        // CALL). Outbound CALLRESULTs are not tracked, so there is no ActionId to resolve -
+                        // dispatch generically rather than per-action, and leave last_call_ untouched.
+                        for (auto& ptr : response_handlers_) {
+                            if (ptr != nullptr) {
+                                ptr->onCallResultError(unique_id, error);
+                            }
+                        }
+
+                        return;
+                    }
             }
         }
 
@@ -461,6 +512,21 @@ namespace chargelab::ocpp2_0 {
                 json::JsonWriter writer {stream};
                 writer.StartArray();
                 writer.Int((int)MessageType::kCallError);
+                writer.String(unique_id);
+                json::WriteValue<ErrorCode>::write_json(writer, error.code);
+                writer.String(error.description.value());
+                json::WriteValue<common::RawJson>::write_json(writer, error.details);
+                writer.EndArray();
+            });
+        }
+
+        // OCPP 2.1 CALLRESULTERROR (message type 5): sent to reject a CALLRESULT we could not process.
+        // Identical payload layout to CALLERROR, only the message type id differs.
+        static void sendCallResultError(WebsocketInterface& websocket, std::string const& unique_id, CallError const& error) {
+            websocket.sendCustom([&](ByteWriterInterface& stream) {
+                json::JsonWriter writer {stream};
+                writer.StartArray();
+                writer.Int((int)MessageType::kCallResultError);
                 writer.String(unique_id);
                 json::WriteValue<ErrorCode>::write_json(writer, error.code);
                 writer.String(error.description.value());

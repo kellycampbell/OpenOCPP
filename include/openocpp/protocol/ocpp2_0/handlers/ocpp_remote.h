@@ -67,6 +67,7 @@
 #include "openocpp/protocol/ocpp2_0/messages/update_firmware.h"
 #include "openocpp/protocol/ocpp2_0/types/action_id.h"
 #include "openocpp/protocol/ocpp2_0/types/message_type.h"
+#include "openocpp/protocol/ocpp2_0/types/call_error.h"
 #include "openocpp/protocol/common/raw_json.h"
 #include "openocpp/interface/element/websocket_interface.h"
 
@@ -142,11 +143,86 @@ namespace chargelab::ocpp2_0 {
             return true;
         }
 
+        // OCPP 2.1 SEND (message type 6): a fire-and-forget message shaped like a CALL but with no
+        // CALLRESULT expected in reply. Not registered as a pending call.
+        template <typename T>
+        std::optional<std::string> sendSend(T const& payload) {
+            return executeSend(T::kActionId, payload);
+        }
+
+        std::optional<std::string> sendSend(ActionId const& action, std::string const& payload) {
+            return executeSend(action, common::RawJson{payload});
+        }
+
+        // OCPP 2.1 CALLRESULTERROR (message type 5): sent to reject a CALLRESULT we received but could
+        // not process. This is a reply, so it is not gated on registration and is not tracked as a call.
+        bool sendCallResultError(std::string const& unique_id, CallError const& error) {
+            if (!websocket_interface_.isConnected())
+                return false;
+
+            CHARGELAB_TRY {
+                websocket_interface_.sendCustom([&](ByteWriterInterface& stream) {
+                    json::JsonWriter writer {stream};
+                    writer.StartArray();
+                    writer.Int((int)MessageType::kCallResultError);
+                    writer.String(unique_id);
+                    json::WriteValue<ErrorCode>::write_json(writer, error.code);
+                    writer.String(error.description.value());
+                    json::WriteValue<common::RawJson>::write_json(writer, error.details);
+                    writer.EndArray();
+                });
+                return true;
+            } CHARGELAB_CATCH {
+                CHARGELAB_LOG_MESSAGE(error) << "Failed sending call result error with: " << e.what();
+                return false;
+            }
+        }
+
         void sendUnmanagedMessage(std::function<void(ByteWriterInterface&)> payload) {
             websocket_interface_.sendCustom(std::move(payload));
         }
 
     private:
+        template <typename T>
+        std::optional<std::string> executeSend(ActionId const& action, T const& payload) {
+            if (!websocket_interface_.isConnected())
+                return std::nullopt;
+
+            if (!registration_complete_()) {
+                switch (action) {
+                    default:
+                        CHARGELAB_LOG_MESSAGE(info) << "Registration not complete - blocking send: " << action;
+                        return std::nullopt;
+
+                    // Allow these messages to be sent while registration is pending
+                    case ActionId::kBootNotification:
+                    case ActionId::kNotifyReport:
+                        break;
+                }
+            }
+
+            CHARGELAB_TRY {
+                // A SEND still carries a message id per the OCPP-J framing, but no response is expected
+                // so it is not registered with on_managed_message_ / tracked as a pending call.
+                auto unique_id = std::to_string(request_id_++);
+
+                websocket_interface_.sendCustom([&](ByteWriterInterface& stream) {
+                    json::JsonWriter writer {stream};
+                    writer.StartArray();
+                    writer.Int(MessageType::kSend);
+                    writer.String(unique_id);
+                    writer.String(action.to_string());
+                    json::WriteValue<T>::write_json(writer, payload);
+                    writer.EndArray();
+                });
+
+                return unique_id;
+            }  CHARGELAB_CATCH {
+                CHARGELAB_LOG_MESSAGE(error) << "Failed sending send with: " << e.what();
+                return std::nullopt;
+            }
+        }
+
         template <typename T>
         std::optional<std::string> executeCall(ActionId const& action, T const& payload) {
             if (!websocket_interface_.isConnected())

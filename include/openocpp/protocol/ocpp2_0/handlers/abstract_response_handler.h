@@ -78,6 +78,11 @@ namespace chargelab::ocpp2_0 {
 #undef CHARGELAB_RESPONSE_HANDLER_TEMPLATE
 
         virtual void onCallRsp(std::string const&, ocpp2_0::ResponseMessage<common::RawJson> const&) {}
+
+        // Invoked when a CALLRESULTERROR (OCPP 2.1 message type 5) is received - i.e. the remote could
+        // not process a CALLRESULT we sent. There is no ActionId to resolve (outbound CALLRESULTs are not
+        // tracked), so this is dispatched generically rather than per-action.
+        virtual void onCallResultError(std::string const&, ocpp2_0::CallError const&) {}
     };
 }
 

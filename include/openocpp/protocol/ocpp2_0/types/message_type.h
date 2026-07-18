@@ -10,7 +10,9 @@ namespace chargelab::ocpp2_0 {
             kValueNotFoundInEnum = -1,
             kCall = 2,
             kCallResult = 3,
-            kCallError = 4
+            kCallError = 4,
+            kCallResultError = 5,
+            kSend = 6
         };
 
     public:
@@ -28,6 +30,8 @@ namespace chargelab::ocpp2_0 {
                 case kCall: value = kCall; break;
                 case kCallResult: value = kCallResult; break;
                 case kCallError: value = kCallError; break;
+                case kCallResultError: value = kCallResultError; break;
+                case kSend: value = kSend; break;
                 default: value = kValueNotFoundInEnum; break;
             }
 
