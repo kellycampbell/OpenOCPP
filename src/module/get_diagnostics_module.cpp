@@ -3,16 +3,16 @@
 namespace chargelab {
 
 GetDiagnosticsModule::GetDiagnosticsModule(
-        Settings& settings,
+        std::shared_ptr<Settings> settings,
         std::shared_ptr<SystemInterface> system_interface,
         std::shared_ptr<UploadInterface> upload
 ) :
+        settings_(std::move(settings)),
         system_interface_(std::move(system_interface)),
-        upload_(std::move(upload)),
-        charge_point_id_ {settings.getSetting(settings::CommonKey::kChargePointId)}
+        upload_(std::move(upload))
 {
-    listener_ = std::make_shared<LoggingListenerFunction>([&](LogMetadata const& metadata, std::string_view const& message) {
-        if (metadata.level != LogLevel::warning && metadata.level != LogLevel::error && metadata.level != LogLevel::fatal)
+    listener_ = std::make_shared<logging::LoggingListenerFunction>([&](logging::LogMetadata const& metadata, std::string_view const& message) {
+        if (metadata.level != logging::LogLevel::warning && metadata.level != logging::LogLevel::error && metadata.level != logging::LogLevel::fatal)
             return;
 
         detail::DiagnosticsLine line {};
@@ -41,15 +41,15 @@ GetDiagnosticsModule::GetDiagnosticsModule(
         }
     });
 
-    RegisterLoggingListener(listener_); // register this callback to the global listener
+    logging::RegisterLoggingListener(listener_); // register this callback to the global listener
 }
 
 GetDiagnosticsModule::~GetDiagnosticsModule() {
     CHARGELAB_LOG_MESSAGE(debug) << "Deleting GetDiagnosticsModule";
-    UnregisterLoggingListener(listener_);
+    logging::UnregisterLoggingListener(listener_);
 }
 
-void GetDiagnosticsModule::runStep(ocpp1_6::ChargePointRemoteInterface &remote) {
+void GetDiagnosticsModule::runStep(ocpp1_6::OcppRemote &remote) {
     if (!in_progress_.has_value())
         return;
 
@@ -96,8 +96,8 @@ GetDiagnosticsModule::onGetDiagnosticsReq(
     if (in_progress_.has_value()) {
         return ocpp1_6::CallError {
                 ocpp1_6::ErrorCode::kGenericError,
-                "InProgress",
-                "An uploading diagnostics operation is already in progress"
+                "An uploading diagnostics operation is already in progress",
+                common::RawJson::empty_object()
         };
     }
 
@@ -171,7 +171,7 @@ GetDiagnosticsModule::onGetDiagnosticsReq(
                 }
                 // uploading
                 std::vector<uint8_t> const &content = state.current_upload.value();
-                auto result = upload_->write(state.location, content, append, [&](std::size_t) {});
+                auto result = upload_->upload(state.location, content, append, [&](std::size_t) {});
                 if (result == UploadInterface::Result::kFailed) {
                     if (++state.failed_attempts > state.total_retries) {
                         CHARGELAB_LOG_MESSAGE(warning) << "Diagnostics upload failed writing";
@@ -219,7 +219,7 @@ std::string GetDiagnosticsModule::buildDiagnosticsFileName() {
     char buf[100];
     sprintf(buf, "%d-%02d-%02dT%02d-%02d-%02dZ", tm->tm_year+1900, tm->tm_mon+1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec);
 
-    std::string file_name = "diagn_" + charge_point_id_.getValue() + "_" + std::string(buf) + ".txt";
+    std::string file_name = "diagn_" + settings_->ChargePointId.getValue() + "_" + std::string(buf) + ".txt";
 
     return file_name;
 }
