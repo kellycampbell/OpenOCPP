@@ -74,6 +74,15 @@ namespace chargelab {
             int supply_phases;
             CHARGELAB_JSON_INTRUSIVE(StationMetadata, supply_phases)
         };
+
+        // A single named temperature reading, in degrees Celsius. 'valid' is false when the
+        // sensor is not installed/readable.
+        struct TemperatureReading {
+            std::string location;
+            double celsius;
+            bool valid;
+            CHARGELAB_JSON_INTRUSIVE(TemperatureReading, location, celsius, valid)
+        };
     }
 
     class StationInterface {
@@ -147,6 +156,14 @@ namespace chargelab {
          * @return the meter values data if available, otherwise an empty vector
          */
         virtual std::vector<ocpp2_0::SampledValueType> pollMeterValues2_0(std::optional<ocpp2_0::EVSEType> const& evse) = 0;
+
+        /**
+         * Returns the station's current named temperature readings, in degrees Celsius. Used to stream
+         * temperature telemetry via OCPP 2.1 periodic event streams. Default is an empty list.
+         *
+         * @return the current temperature readings, or an empty vector if none are available
+         */
+        virtual std::vector<charger::TemperatureReading> getTemperatures() { return {}; }
 
         /**
          * Enables/disables charging on a particular connector.

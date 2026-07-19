@@ -18,6 +18,7 @@
 #include "openocpp/protocol/ocpp1_6/handlers/ocpp_message_handler.h"
 #include "openocpp/module/power_management_module2_0.h"
 #include "openocpp/module/transaction_module2_0.h"
+#include "openocpp/module/temperature_stream_module.h"
 #include "openocpp/protocol/ocpp2_0/handlers/ocpp_message_handler.h"
 
 #include "openocpp/implementation/hash_methods_mbedtls.h"
@@ -47,6 +48,7 @@ namespace chargelab {
 
         std::shared_ptr<PowerManagementModule2_0> power_management_module2_0;
         std::shared_ptr<TransactionModule2_0> transaction_module2_0;
+        std::shared_ptr<TemperatureStreamModule> temperature_stream_module;
         std::shared_ptr<ocpp2_0::OcppMessageHandler> message_handler2_0;
 
     public:
@@ -150,6 +152,12 @@ namespace chargelab {
                     nullptr  // TODO: will provide the transaction listener 2_0 from another moudle, e.g. for handling CTEP
             );
 
+            temperature_stream_module = std::make_shared<TemperatureStreamModule>(
+                    notNull(settings),
+                    notNull(platform),
+                    notNull(station)
+            );
+
             message_handler2_0 = std::make_shared<ocpp2_0::OcppMessageHandler>(
                     notNull(settings),
                     notNull(platform),
@@ -165,6 +173,7 @@ namespace chargelab {
                             get_logs_module,
                             power_management_module2_0,
                             transaction_module2_0,
+                            temperature_stream_module,
                             fallback_module
                     },
                     // TODO: As above; remove this?

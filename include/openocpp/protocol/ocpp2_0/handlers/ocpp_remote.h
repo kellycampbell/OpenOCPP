@@ -183,22 +183,18 @@ namespace chargelab::ocpp2_0 {
         }
 
     private:
-        template <typename T>
-        std::optional<std::string> executeSend(ActionId const& action, T const& payload) {
+        // Templated on the action-id type so it accepts both ocpp2_0::ActionId and the
+        // OCPP 2.1 action ids (ocpp2_1::ActionId) - a SEND only needs action.to_string().
+        template <typename ActionT, typename T>
+        std::optional<std::string> executeSend(ActionT const& action, T const& payload) {
             if (!websocket_interface_.isConnected())
                 return std::nullopt;
 
+            // SEND messages are never boot-critical, so they are simply gated on
+            // registration being complete (no per-action exceptions like executeCall).
             if (!registration_complete_()) {
-                switch (action) {
-                    default:
-                        CHARGELAB_LOG_MESSAGE(info) << "Registration not complete - blocking send: " << action;
-                        return std::nullopt;
-
-                    // Allow these messages to be sent while registration is pending
-                    case ActionId::kBootNotification:
-                    case ActionId::kNotifyReport:
-                        break;
-                }
+                CHARGELAB_LOG_MESSAGE(info) << "Registration not complete - blocking send: " << action.to_string();
+                return std::nullopt;
             }
 
             CHARGELAB_TRY {
