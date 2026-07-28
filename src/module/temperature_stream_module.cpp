@@ -1,5 +1,7 @@
 #include "openocpp/module/temperature_stream_module.h"
+#include "openocpp/protocol/common/protocol_constants.h"
 #include "openocpp/protocol/ocpp2_1/messages/notify_periodic_event_stream.h"
+#include "openocpp/helpers/string.h"
 
 #include <cstdio>
 #include <string>
@@ -29,6 +31,13 @@ TemperatureStreamModule::~TemperatureStreamModule() {
 }
 
 void TemperatureStreamModule::runStep(ocpp2_0::OcppRemote& remote) {
+    // NotifyPeriodicEventStream is an OCPP 2.1 SEND message; only stream when the negotiated
+    // websocket subprotocol is ocpp2.1, otherwise it would be sent to a server that can't handle it.
+    auto const subprotocol = remote.getSubprotocol();
+    if (!subprotocol.has_value() || !string::EqualsIgnoreCaseAscii(subprotocol.value(), ProtocolConstants::kProtocolOcpp2_1)) {
+        return;
+    }
+
     auto const now = system_->steadyClockNow();
     if (last_sent_.has_value()) {
         auto const elapsed_seconds = ((std::int64_t)now - (std::int64_t)last_sent_.value()) / 1000;

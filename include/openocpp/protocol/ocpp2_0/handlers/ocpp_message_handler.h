@@ -1,6 +1,7 @@
 #ifndef CHARGELAB_OPEN_FIRMWARE_2_0_OCPP_MESSAGE_HANDLER_H
 #define CHARGELAB_OPEN_FIRMWARE_2_0_OCPP_MESSAGE_HANDLER_H
  
+#include "openocpp/protocol/common/protocol_constants.h"
 #include "openocpp/protocol/ocpp2_0/handlers/abstract_service.h"
 #include "openocpp/protocol/ocpp2_0/handlers/abstract_request_handler.h"
 #include "openocpp/protocol/ocpp2_0/handlers/abstract_response_handler.h"
@@ -65,8 +66,8 @@ namespace chargelab::ocpp2_0 {
 
             auto const subprotocol = websocket->getSubprotocol();
             if (!subprotocol.has_value() ||
-                (!string::EqualsIgnoreCaseAscii(subprotocol.value(), "ocpp2.0.1") &&
-                 !string::EqualsIgnoreCaseAscii(subprotocol.value(), "ocpp2.1"))) {
+                (!string::EqualsIgnoreCaseAscii(subprotocol.value(), ProtocolConstants::kProtocolOcpp2_0_1) &&
+                 !string::EqualsIgnoreCaseAscii(subprotocol.value(), ProtocolConstants::kProtocolOcpp2_1))) {
                 CHARGELAB_LOG_MESSAGE(trace) << "Skipping OCPP 2.0.1/2.1 message handler based on websocket subprotocol: " << subprotocol;
                 return;
             }

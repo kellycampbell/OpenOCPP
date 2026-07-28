@@ -143,6 +143,12 @@ namespace chargelab::ocpp2_0 {
             return true;
         }
 
+        // Negotiated websocket subprotocol (e.g. "ocpp2.1"), or empty if not connected. Used to
+        // gate OCPP 2.1-only messages so they aren't sent to a 2.0.1/1.6 server.
+        std::optional<std::string> getSubprotocol() {
+            return websocket_interface_.getSubprotocol();
+        }
+
         // OCPP 2.1 SEND (message type 6): a fire-and-forget message shaped like a CALL but with no
         // CALLRESULT expected in reply. Not registered as a pending call.
         template <typename T>
