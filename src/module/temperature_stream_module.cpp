@@ -38,6 +38,12 @@ void TemperatureStreamModule::runStep(ocpp2_0::OcppRemote& remote) {
         return;
     }
 
+    // Only stream temperatures while a transaction is active; the flag is driven by
+    // onTransactionUpdate below.
+    if (!transaction_active_) {
+        return;
+    }
+
     auto const now = system_->steadyClockNow();
     if (last_sent_.has_value()) {
         auto const elapsed_seconds = ((std::int64_t)now - (std::int64_t)last_sent_.value()) / 1000;
@@ -72,6 +78,27 @@ void TemperatureStreamModule::runStep(ocpp2_0::OcppRemote& remote) {
     req.basetime = ocpp2_1::DateTime {system_->systemClockNow()};
 
     remote.sendSend(req);
+}
+
+void TemperatureStreamModule::onTransactionUpdate(
+        Status status,
+        std::optional<ocpp2_0::EVSEType> const& evse,
+        transaction_module2_0::TransactionContainer const& transaction,
+        std::optional<charger::ConnectorStatus> const& connector_status,
+        std::optional<std::vector<ocpp2_0::SampledValueType>> const& sampled_values
+) {
+    (void)evse;
+    (void)transaction;
+    (void)connector_status;
+    (void)sampled_values;
+
+    bool const active = status != TransactionListener2_0::Status::kStopped;
+    if (active && !transaction_active_) {
+        // Stream on the next runStep rather than waiting out any remaining interval from a
+        // previous transaction.
+        last_sent_ = std::nullopt;
+    }
+    transaction_active_ = active;
 }
 
 } // namespace chargelab

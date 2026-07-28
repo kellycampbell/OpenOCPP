@@ -142,6 +142,14 @@ namespace chargelab {
                     platform->getPartition("pmjournal")
             );
 
+            // Created before the transaction module so it can be registered as the transaction
+            // listener; it only streams temperatures while a transaction is active.
+            temperature_stream_module = std::make_shared<TemperatureStreamModule>(
+                    notNull(settings),
+                    notNull(platform),
+                    notNull(station)
+            );
+
             transaction_module2_0 = std::make_shared<TransactionModule2_0>(
                     notNull(platform),
                     notNull(boot_notification_module),
@@ -149,13 +157,7 @@ namespace chargelab {
                     notNull(pending_messages_module),
                     notNull(connector_status_module),
                     notNull(station),
-                    nullptr  // TODO: will provide the transaction listener 2_0 from another moudle, e.g. for handling CTEP
-            );
-
-            temperature_stream_module = std::make_shared<TemperatureStreamModule>(
-                    notNull(settings),
-                    notNull(platform),
-                    notNull(station)
+                    notNull(temperature_stream_module)
             );
 
             message_handler2_0 = std::make_shared<ocpp2_0::OcppMessageHandler>(

@@ -851,16 +851,18 @@ void TransactionModule2_0::stopTransaction(
                     true
             }
     );
-    active = std::nullopt;
-
+    // Notify the listener while the transaction is still engaged; clearing it below would
+    // leave active_transactions_[evse] empty and dereferencing it here would abort.
     if (transaction_listener_ != nullptr) {
         transaction_listener_->onTransactionUpdate(
             chargelab::TransactionListener2_0::Status::kStopped,
             evse,
-            active_transactions_[evse].value(),
-            station_->pollConnectorStatus(evse.value()),
+            active.value(),
+            evse.has_value() ? station_->pollConnectorStatus(evse.value()) : std::nullopt,
             final_values.original);
     }
+
+    active = std::nullopt;
 }
 
 void TransactionModule2_0::processRfidTap(ocpp2_0::IdTokenType const& id_token) {
