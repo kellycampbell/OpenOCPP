@@ -6,6 +6,7 @@ namespace chargelab {
     public:
         static constexpr char const* kProtocolOcpp1_6 = "ocpp1.6";
         static constexpr char const* kProtocolOcpp2_0_1 = "ocpp2.0.1";
+        static constexpr char const* kProtocolOcpp2_1 = "ocpp2.1";
     };
 }
 

@@ -436,6 +436,10 @@ ConfigurationModule::onSetNetworkProfileReq(const ocpp2_0::SetNetworkProfileRequ
         case ocpp2_0::OCPPVersionEnumType::kOCPP20:
             protocol = ProtocolConstants::kProtocolOcpp2_0_1;
             break;
+
+        case ocpp2_0::OCPPVersionEnumType::kOCPP21:
+            protocol = ProtocolConstants::kProtocolOcpp2_1;
+            break;
     }
 
     // Note: an assumed "wifi" interface is always used here
