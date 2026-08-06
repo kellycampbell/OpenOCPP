@@ -439,6 +439,17 @@ namespace chargelab {
             performed_boot_checks_ = true;
         }
 
+        /**
+         * Streams the firmware image exactly once: each chunk is flashed to the inactive
+         * partition and folded into the signature hash as it arrives. The image is never
+         * committed - esp_ota_end() and set_boot_partition() only run from the install
+         * step below - so nothing can boot an image whose signature hasn't been checked.
+         *
+         * This replaces an earlier two-pass flow that downloaded the whole image once to
+         * verify it and then downloaded it a second time to flash it, which doubled both
+         * the transfer cost and the window in which a connection drop could kill the
+         * update, and left the bytes that were actually flashed unverified.
+         */
         void performFirmwareUpdate2_0() {
             if (!operation_.has_value())
                 return;
@@ -456,6 +467,7 @@ namespace chargelab {
             if (!operation_->finished_signature_check) {
                 if (operationExhausted(operation_.value(), max_retries)) {
                     checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kDownloadFailed);
+                    abandonUpdateProcess();
                     operation_ = std::nullopt;
                     return;
                 }
@@ -469,15 +481,46 @@ namespace chargelab {
 
                 auto const remaining = (int)operation_->content_length - (int)operation_->total_bytes_read;
                 if (remaining > 0) {
-                    if (operation_->total_bytes_read == 0)
-                        operation_->signature_hash->reset();
-
                     operation_->buffer.resize(kChunkSize);
                     auto const bytes_read = operation_->connection->read((char*)operation_->buffer.data(), (int)operation_->buffer.size());
                     // Note: treating zero bytes read as a failure condition here to prevent an infinite loop under
                     // those conditions.
                     if (bytes_read <= 0) {
                         CHARGELAB_LOG_MESSAGE(warning) << "Failed reading data - retrying operation";
+                        recordFailure(platform_, operation_.value());
+                        return;
+                    }
+
+                    if (operation_->total_bytes_read == 0) {
+                        // Restarting the transfer from the beginning - discard anything a
+                        // previous attempt wrote and start the hash over with it.
+                        abandonUpdateProcess();
+                        operation_->signature_hash->reset();
+                        operation_->block_hashes.clear();
+
+                        if (station_->startUpdateProcess(operation_->content_length) != StationInterface::Result::kSucceeded) {
+                            CHARGELAB_LOG_MESSAGE(warning) << "Failed starting firmware update process";
+                            recordFailure(platform_, operation_.value());
+                            return;
+                        }
+
+                        operation_->running_firmware_update = true;
+                    } else if (!operation_->running_firmware_update) {
+                        CHARGELAB_LOG_MESSAGE(error)
+                            << "Unexpected state - expected running firmware update operation";
+                        recordFailure(platform_, operation_.value());
+                        return;
+                    }
+
+                    auto const chunk_result = station_->processFirmwareChunk(operation_->buffer.data(), bytes_read);
+                    if (chunk_result == StationInterface::Result::kVerificationFailed) {
+                        CHARGELAB_LOG_MESSAGE(warning) << "Firmware image failed verification - abandoning update";
+                        operation_->running_firmware_update = false;
+                        checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInstallVerificationFailed);
+                        operation_ = std::nullopt;
+                        return;
+                    } else if (chunk_result != StationInterface::Result::kSucceeded) {
+                        CHARGELAB_LOG_MESSAGE(warning) << "Failed processing firmware chunk";
                         recordFailure(platform_, operation_.value());
                         return;
                     }
@@ -498,12 +541,7 @@ namespace chargelab {
                     operation_->signature_hash->update((unsigned char const*)operation_->buffer.data(), bytes_read);
                     operation_->total_bytes_read += bytes_read;
                     recordProgress(operation_.value());
-                    CHARGELAB_LOG_MESSAGE(debug) << "Hashing progress: " << operation_->total_bytes_read << " / " << operation_->content_length;
-                    station_->notifyUpdateProgress(
-                            StationInterface::UpdatePhase::kDownloading,
-                            operation_->total_bytes_read,
-                            operation_->content_length
-                    );
+                    CHARGELAB_LOG_MESSAGE(debug) << "Download/flash progress: " << operation_->total_bytes_read << " / " << operation_->content_length;
                 }
 
                 if (operation_->total_bytes_read >= operation_->content_length) {
@@ -511,18 +549,7 @@ namespace chargelab {
 
                     auto signature_hash = operation_->signature_hash->finishBinary();
                     if (!signature_hash.has_value()) {
-                        checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInvalidSignature);
-
-                        // L01.FR.03
-                        pending_messages_->sendRequest2_0(
-                                ocpp2_0::SecurityEventNotificationRequest {
-                                        "InvalidFirmwareSignature",
-                                        platform_->systemClockNow()
-                                },
-                                buildPendingMessagePolicy(PendingMessageType::kSecurityEvent)
-                        );
-
-                        operation_ = std::nullopt;
+                        reportInvalidSignature2_0();
                         return;
                     }
 
@@ -530,18 +557,7 @@ namespace chargelab {
                     if (firmware.signingCertificate.has_value() && firmware.signature.has_value()) {
                         auto signature_binary = HM::decodeBase64(firmware.signature->value());
                         if (!signature_binary.has_value()) {
-                            checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInvalidSignature);
-
-                            // L01.FR.03
-                            pending_messages_->sendRequest2_0(
-                                    ocpp2_0::SecurityEventNotificationRequest {
-                                            "InvalidFirmwareSignature",
-                                            platform_->systemClockNow()
-                                    },
-                                    buildPendingMessagePolicy(PendingMessageType::kSecurityEvent)
-                            );
-
-                            operation_ = std::nullopt;
+                            reportInvalidSignature2_0();
                             return;
                         }
 
@@ -556,18 +572,7 @@ namespace chargelab {
                                 signature_and_hash
                         );
                         if (!valid) {
-                            checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInvalidSignature);
-
-                            // L01.FR.03
-                            pending_messages_->sendRequest2_0(
-                                    ocpp2_0::SecurityEventNotificationRequest {
-                                            "InvalidFirmwareSignature",
-                                            platform_->systemClockNow()
-                                    },
-                                    buildPendingMessagePolicy(PendingMessageType::kSecurityEvent)
-                            );
-
-                            operation_ = std::nullopt;
+                            reportInvalidSignature2_0();
                             return;
                         }
 
@@ -588,7 +593,9 @@ namespace chargelab {
             }
 
             if (!operation_->finished_flashing_firmware) {
-                // L01.FR.16
+                // L01.FR.16 - the image is already written to the inactive partition at this
+                // point, but nothing is committed: the OTA handle stays open and the boot
+                // partition is untouched until the scheduled install time arrives.
                 if (operation_->request.firmware.installDateTime.has_value()) {
                     if (operation_->request.firmware.installDateTime->isAfter(platform_->systemClockNow(), false)) {
                         checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInstallScheduled);
@@ -596,102 +603,58 @@ namespace chargelab {
                     }
                 }
 
-                if (operationExhausted(operation_.value(), max_retries)) {
+                checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInstalling);
+
+                auto const slot_id = station_->getUpdateSlotId();
+                auto const finish_result = station_->finishUpdateProcess(true);
+                operation_->running_firmware_update = false;
+                if (finish_result != StationInterface::Result::kSucceeded) {
+                    // The image is fully downloaded and signature checked by this point, so
+                    // a failure here is the flash write or ESP's own image validation - not
+                    // something another transfer attempt can fix.
+                    CHARGELAB_LOG_MESSAGE(warning) << "Failed finishing update process - abandoning update";
                     checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInstallationFailed);
                     operation_ = std::nullopt;
                     return;
                 }
 
-                checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInstalling);
-                if (waitingForRetry(operation_.value()))
-                    return;
+                operation_->finished_flashing_firmware = true;
+                operation_->connection = nullptr;
+                settings_->ExpectedUpdateFirmwareSlotId.setValueFromString(buildExpectedUpdateFirmwareSlotId(
+                        operation_->request.requestId, slot_id));
+                checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInstallRebooting);
 
-                if (!checkOrRetryConnection(platform_, operation_.value()))
-                    return;
-
-                auto const remaining = (int)operation_->content_length - (int)operation_->total_bytes_read;
-                if (remaining > 0) {
-                    operation_->buffer.resize(kChunkSize);
-                    auto const bytes_read = operation_->connection->read((char*)operation_->buffer.data(), (int)operation_->buffer.size());
-                    // Note: treating zero bytes read as a failure condition here to prevent an infinite loop under
-                    // those conditions.
-                    if (bytes_read <= 0) {
-                        CHARGELAB_LOG_MESSAGE(warning) << "Failed reading data - retrying operation";
-                        recordFailure(platform_, operation_.value());
-                        return;
-                    }
-
-                    if (operation_->total_bytes_read == 0) {
-                        if (operation_->running_firmware_update) {
-                            station_->finishUpdateProcess(false);
-                            operation_->running_firmware_update = false;
-                        }
-
-                        if (station_->startUpdateProcess(operation_->content_length) != StationInterface::Result::kSucceeded) {
-                            CHARGELAB_LOG_MESSAGE(warning) << "Failed starting firmware update process";
-                            recordFailure(platform_, operation_.value());
-                            return;
-                        }
-
-                        operation_->running_firmware_update = true;
-                    } else {
-                        if (!operation_->running_firmware_update) {
-                            CHARGELAB_LOG_MESSAGE(error)
-                                << "Unexpected state - expected running firmware update operation";
-                            recordFailure(platform_, operation_.value());
-                            return;
-                        }
-                    }
-
-                    auto const chunk_result = station_->processFirmwareChunk(operation_->buffer.data(), bytes_read);
-                    if (chunk_result == StationInterface::Result::kVerificationFailed) {
-                        CHARGELAB_LOG_MESSAGE(warning) << "Firmware image failed verification - abandoning update";
-                        operation_->running_firmware_update = false;
-                        checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInstallVerificationFailed);
-                        operation_ = std::nullopt;
-                        return;
-                    } else if (chunk_result != StationInterface::Result::kSucceeded) {
-                        CHARGELAB_LOG_MESSAGE(warning) << "Failed processing firmware chunk";
-                        recordFailure(platform_, operation_.value());
-                        return;
-                    }
-
-                    operation_->signature_hash->update((unsigned char const*)operation_->buffer.data(), bytes_read);
-                    operation_->total_bytes_read += bytes_read;
-                    recordProgress(operation_.value());
-                    CHARGELAB_LOG_MESSAGE(debug) << "Flashing progress: " << operation_->total_bytes_read << " / " << operation_->content_length;
-                }
-
-                if (operation_->total_bytes_read >= operation_->content_length) {
-                    // TODO: Check signature
-
-                    auto const slot_id = station_->getUpdateSlotId();
-                    auto const finish_result = station_->finishUpdateProcess(true);
-                    if (finish_result == StationInterface::Result::kVerificationFailed) {
-                        CHARGELAB_LOG_MESSAGE(warning) << "Firmware image failed verification - abandoning update";
-                        operation_->running_firmware_update = false;
-                        checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInstallVerificationFailed);
-                        operation_ = std::nullopt;
-                        return;
-                    } else if (finish_result != StationInterface::Result::kSucceeded) {
-                        CHARGELAB_LOG_MESSAGE(warning) << "Failed finishing update process";
-                        operation_->running_firmware_update = false;
-                        recordFailure(platform_, operation_.value());
-                        return;
-                    }
-
-                    operation_->finished_flashing_firmware = true;
-                    operation_->connection = nullptr;
-                    // settings_->ExpectedUpdateFirmwareSlotId.setValueFromString(std::to_string(operation_->request.requestId) + ":" + slot_id);
-                    settings_->ExpectedUpdateFirmwareSlotId.setValueFromString(buildExpectedUpdateFirmwareSlotId(
-                            operation_->request.requestId, slot_id));
-                    checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInstallRebooting);
-
-                    reset_->resetOnIdle(ocpp2_0::BootReasonEnumType::kFirmwareUpdate);
-                }
-
+                reset_->resetOnIdle(ocpp2_0::BootReasonEnumType::kFirmwareUpdate);
                 return;
             }
+        }
+
+        /**
+         * Discards anything a previous attempt wrote to the inactive partition. Safe to
+         * call when no update process is running.
+         */
+        void abandonUpdateProcess() {
+            if (!operation_.has_value() || !operation_->running_firmware_update)
+                return;
+
+            station_->finishUpdateProcess(false);
+            operation_->running_firmware_update = false;
+        }
+
+        // L01.FR.03
+        void reportInvalidSignature2_0() {
+            checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInvalidSignature);
+            abandonUpdateProcess();
+
+            pending_messages_->sendRequest2_0(
+                    ocpp2_0::SecurityEventNotificationRequest {
+                            "InvalidFirmwareSignature",
+                            platform_->systemClockNow()
+                    },
+                    buildPendingMessagePolicy(PendingMessageType::kSecurityEvent)
+            );
+
+            operation_ = std::nullopt;
         }
 
         void performBootChecks1_6() {
