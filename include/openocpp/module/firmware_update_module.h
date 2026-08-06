@@ -58,6 +58,7 @@ namespace chargelab {
 
         // Retry pacing used when the CSMS didn't specify a retryInterval: exponential
         // backoff from kBaseRetryDelaySeconds, capped at kMaxRetryDelaySeconds.
+        static constexpr int kHttpStatusPartialContent = 206;
         static constexpr int kBaseRetryDelaySeconds = 10;
         static constexpr int kMaxRetryDelaySeconds = 5*60;
         static constexpr int kMaxBackoffShift = 5;
@@ -321,6 +322,16 @@ namespace chargelab {
             return false;
         }
 
+        /**
+         * Opens the firmware download connection if one isn't already established,
+         * resuming from wherever the last attempt stopped when possible.
+         *
+         * A transfer can only be resumed while the flash side is still consistent with
+         * total_bytes_read - that is, while an update process is running. Callers that
+         * discard what was written must reset total_bytes_read to 0, which forces a fresh
+         * request here. A server that ignores the Range header and answers 200 also
+         * restarts the transfer.
+         */
         static bool checkOrRetryConnection(
                 std::shared_ptr<PlatformInterface> const& platform,
                 detail::FirmwareUpdateOperation<HM>& operation
@@ -328,13 +339,28 @@ namespace chargelab {
             if (operation.connection != nullptr)
                 return true;
 
+            bool const resuming = operation.total_bytes_read > 0 && operation.running_firmware_update;
+            if (!resuming) {
+                operation.total_bytes_read = 0;
+            }
+
             auto const uri = operation.request.firmware.location.value();
-            CHARGELAB_LOG_MESSAGE(info) << "Downloading firmware from: " << uri;
+            if (resuming) {
+                CHARGELAB_LOG_MESSAGE(info) << "Resuming firmware download from byte " << operation.total_bytes_read << ": " << uri;
+            } else {
+                CHARGELAB_LOG_MESSAGE(info) << "Downloading firmware from: " << uri;
+            }
+
             operation.connection = platform->getRequest(uri);
             if (operation.connection == nullptr) {
                 CHARGELAB_LOG_MESSAGE(warning) << "Failed establishing connection to: " << uri;
                 recordFailure(platform, operation);
                 return false;
+            }
+
+            // Must be set before open()
+            if (resuming) {
+                operation.connection->setHeader("Range", "bytes=" + std::to_string(operation.total_bytes_read) + "-");
             }
 
             if (!operation.connection->open(0)) {
@@ -356,8 +382,31 @@ namespace chargelab {
                 return false;
             }
 
-            operation.content_length = operation.connection->getContentLength();
-            operation.total_bytes_read = 0;
+            auto const body_length = operation.connection->getContentLength();
+            if (resuming) {
+                if (status == kHttpStatusPartialContent) {
+                    // On a 206 the reported length covers the remaining bytes only
+                    auto const total_length = operation.total_bytes_read + body_length;
+                    if (operation.content_length != 0 && total_length != operation.content_length) {
+                        CHARGELAB_LOG_MESSAGE(warning) << "Resumed transfer size mismatch: " << total_length
+                                << " != " << operation.content_length << " - restarting download";
+                        operation.total_bytes_read = 0;
+                        operation.content_length = total_length;
+                        operation.connection = nullptr;
+                        return false;
+                    }
+
+                    operation.content_length = total_length;
+                    return true;
+                }
+
+                // The server ignored the Range header and is sending the whole image again
+                CHARGELAB_LOG_MESSAGE(info) << "Server did not honour Range request (status " << status
+                        << ") - restarting download from the beginning";
+                operation.total_bytes_read = 0;
+            }
+
+            operation.content_length = body_length;
             return true;
         }
 
@@ -508,6 +557,7 @@ namespace chargelab {
                     } else if (!operation_->running_firmware_update) {
                         CHARGELAB_LOG_MESSAGE(error)
                             << "Unexpected state - expected running firmware update operation";
+                        operation_->total_bytes_read = 0;
                         recordFailure(platform_, operation_.value());
                         return;
                     }
@@ -521,6 +571,10 @@ namespace chargelab {
                         return;
                     } else if (chunk_result != StationInterface::Result::kSucceeded) {
                         CHARGELAB_LOG_MESSAGE(warning) << "Failed processing firmware chunk";
+                        // A failed write leaves the partition inconsistent with
+                        // total_bytes_read, so the next attempt has to start over
+                        operation_->running_firmware_update = false;
+                        operation_->total_bytes_read = 0;
                         recordFailure(platform_, operation_.value());
                         return;
                     }
@@ -749,6 +803,7 @@ namespace chargelab {
                     if (!operation_->running_firmware_update) {
                         CHARGELAB_LOG_MESSAGE(error)
                             << "Unexpected state - expected running firmware update operation";
+                        operation_->total_bytes_read = 0;
                         recordFailure(platform_, operation_.value());
                         return;
                     }
@@ -764,6 +819,10 @@ namespace chargelab {
                     return;
                 } else if (chunk_result != StationInterface::Result::kSucceeded) {
                     CHARGELAB_LOG_MESSAGE(warning) << "Failed processing firmware chunk";
+                    // A failed write leaves the partition inconsistent with
+                    // total_bytes_read, so the next attempt has to start over
+                    operation_->running_firmware_update = false;
+                    operation_->total_bytes_read = 0;
                     recordFailure(platform_, operation_.value());
                     return;
                 }
