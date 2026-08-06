@@ -577,8 +577,16 @@ namespace chargelab {
                     // TODO: Check signature
 
                     auto const slot_id = station_->getUpdateSlotId();
-                    if (station_->finishUpdateProcess(true) != StationInterface::Result::kSucceeded) {
+                    auto const finish_result = station_->finishUpdateProcess(true);
+                    if (finish_result == StationInterface::Result::kVerificationFailed) {
+                        CHARGELAB_LOG_MESSAGE(warning) << "Firmware image failed verification - abandoning update";
+                        operation_->running_firmware_update = false;
+                        checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInstallVerificationFailed);
+                        operation_ = std::nullopt;
+                        return;
+                    } else if (finish_result != StationInterface::Result::kSucceeded) {
                         CHARGELAB_LOG_MESSAGE(warning) << "Failed finishing update process";
+                        operation_->running_firmware_update = false;
                         operation_->connection = nullptr;
                         operation_->total_failures++;
                         return;
@@ -730,8 +738,18 @@ namespace chargelab {
                 }
 
                 auto const slot_id = station_->getUpdateSlotId();
-                if (station_->finishUpdateProcess(true) != StationInterface::Result::kSucceeded) {
+                auto const finish_result = station_->finishUpdateProcess(true);
+                if (finish_result == StationInterface::Result::kVerificationFailed) {
+                    // OCPP 1.6 has no InstallVerificationFailed status - report InstallationFailed
+                    CHARGELAB_LOG_MESSAGE(warning) << "Firmware image failed verification - abandoning update";
+                    operation_->running_firmware_update = false;
+                    checkAndUpdateStatus(ocpp1_6::FirmwareStatus::kInstallationFailed);
+                    operation_ = std::nullopt;
+                    restoreConnector0OperativeIfNeeded();
+                    return;
+                } else if (finish_result != StationInterface::Result::kSucceeded) {
                     CHARGELAB_LOG_MESSAGE(warning) << "Failed finishing update process";
+                    operation_->running_firmware_update = false;
                     operation_->connection = nullptr;
                     operation_->total_failures++;
                     return;
