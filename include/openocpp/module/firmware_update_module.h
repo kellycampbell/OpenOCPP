@@ -142,6 +142,7 @@ namespace chargelab {
                 }
             };
 
+            markOperationPending(0);
             return ocpp1_6::UpdateFirmwareRsp {};
         }
 
@@ -192,11 +193,13 @@ namespace chargelab {
             auto status = ocpp2_0::UpdateFirmwareStatusEnumType::kAccepted;
             if (operation_.has_value()) {
                 // L01.FR.24
+                abandonUpdateProcess();
                 operation_ = std::nullopt;
                 status = ocpp2_0::UpdateFirmwareStatusEnumType::kAcceptedCanceled;
             }
 
             operation_ = detail::FirmwareUpdateOperation<HM>{request};
+            markOperationPending(request.requestId);
             return ocpp2_0::UpdateFirmwareResponse{status};
         }
 
@@ -483,6 +486,23 @@ namespace chargelab {
                 );
 
                 settings_->ExpectedUpdateFirmwareSlotId.setValue("");
+                takeInterruptedUpdateRequestId();
+            } else {
+                // An update that was still downloading or installing when the station went
+                // down - report it rather than leaving the CSMS waiting on a status that
+                // will never arrive.
+                auto const interrupted = takeInterruptedUpdateRequestId();
+                if (interrupted.has_value()) {
+                    CHARGELAB_LOG_MESSAGE(warning) << "Firmware update " << interrupted.value()
+                            << " was interrupted by a restart - reporting InstallationFailed";
+                    pending_messages_->sendRequest2_0(
+                            ocpp2_0::FirmwareStatusNotificationRequest {
+                                    ocpp2_0::FirmwareStatusEnumType::kInstallationFailed,
+                                    interrupted.value()
+                            },
+                            buildPendingMessagePolicy(PendingMessageType::kNotificationEvent)
+                    );
+                }
             }
 
             performed_boot_checks_ = true;
@@ -517,7 +537,7 @@ namespace chargelab {
                 if (operationExhausted(operation_.value(), max_retries)) {
                     checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kDownloadFailed);
                     abandonUpdateProcess();
-                    operation_ = std::nullopt;
+                    clearOperation();
                     return;
                 }
 
@@ -567,7 +587,7 @@ namespace chargelab {
                         CHARGELAB_LOG_MESSAGE(warning) << "Firmware image failed verification - abandoning update";
                         operation_->running_firmware_update = false;
                         checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInstallVerificationFailed);
-                        operation_ = std::nullopt;
+                        clearOperation();
                         return;
                     } else if (chunk_result != StationInterface::Result::kSucceeded) {
                         CHARGELAB_LOG_MESSAGE(warning) << "Failed processing firmware chunk";
@@ -668,7 +688,7 @@ namespace chargelab {
                     // something another transfer attempt can fix.
                     CHARGELAB_LOG_MESSAGE(warning) << "Failed finishing update process - abandoning update";
                     checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInstallationFailed);
-                    operation_ = std::nullopt;
+                    clearOperation();
                     return;
                 }
 
@@ -676,11 +696,51 @@ namespace chargelab {
                 operation_->connection = nullptr;
                 settings_->ExpectedUpdateFirmwareSlotId.setValueFromString(buildExpectedUpdateFirmwareSlotId(
                         operation_->request.requestId, slot_id));
+                settings_->PendingFirmwareUpdateRequestId.setValue("");
+                settings_->saveIfModified();
                 checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInstallRebooting);
 
                 reset_->resetOnIdle(ocpp2_0::BootReasonEnumType::kFirmwareUpdate);
                 return;
             }
+        }
+
+        /**
+         * Records that an update operation is in flight, so an update interrupted by a
+         * reboot can be reported to the CSMS rather than leaving it waiting forever on a
+         * status that will never arrive. See reportInterruptedUpdate().
+         */
+        void markOperationPending(int request_id) {
+            settings_->PendingFirmwareUpdateRequestId.setValueFromString(std::to_string(request_id));
+            settings_->saveIfModified();
+        }
+
+        /**
+         * Ends the current operation, discarding anything it wrote to the inactive
+         * partition and clearing the in-flight marker.
+         */
+        void clearOperation() {
+            abandonUpdateProcess();
+            operation_ = std::nullopt;
+
+            if (!settings_->PendingFirmwareUpdateRequestId.getValue().empty()) {
+                settings_->PendingFirmwareUpdateRequestId.setValue("");
+                settings_->saveIfModified();
+            }
+        }
+
+        /**
+         * @return the request id of an update that was in flight when the station last
+         *         went down, if any. Clears the marker.
+         */
+        std::optional<int> takeInterruptedUpdateRequestId() {
+            auto const pending = settings_->PendingFirmwareUpdateRequestId.getValue();
+            if (pending.empty())
+                return std::nullopt;
+
+            settings_->PendingFirmwareUpdateRequestId.setValue("");
+            settings_->saveIfModified();
+            return optional::GetOrDefault(string::ToInteger(pending), 0);
         }
 
         /**
@@ -708,7 +768,7 @@ namespace chargelab {
                     buildPendingMessagePolicy(PendingMessageType::kSecurityEvent)
             );
 
-            operation_ = std::nullopt;
+            clearOperation();
         }
 
         void performBootChecks1_6() {
@@ -735,6 +795,20 @@ namespace chargelab {
                 );
 
                 settings_->ExpectedUpdateFirmwareSlotId.setValue("");
+                takeInterruptedUpdateRequestId();
+            } else {
+                // An update that was still downloading or installing when the station went
+                // down - report it rather than leaving the CSMS waiting on a status that
+                // will never arrive.
+                if (takeInterruptedUpdateRequestId().has_value()) {
+                    CHARGELAB_LOG_MESSAGE(warning) << "Firmware update was interrupted by a restart - reporting InstallationFailed";
+                    pending_messages_->sendRequest1_6(
+                            ocpp1_6::FirmwareStatusNotificationReq {
+                                    ocpp1_6::FirmwareStatus::kInstallationFailed
+                            },
+                            buildPendingMessagePolicy(PendingMessageType::kNotificationEvent)
+                    );
+                }
             }
 
             performed_boot_checks_ = true;
@@ -755,7 +829,7 @@ namespace chargelab {
                 } else {
                     checkAndUpdateStatus(ocpp1_6::FirmwareStatus::kInstallationFailed);
                 }
-                operation_ = std::nullopt;
+                clearOperation();
                 restoreConnector0OperativeIfNeeded();
                 return;
             }
@@ -815,7 +889,7 @@ namespace chargelab {
                     CHARGELAB_LOG_MESSAGE(warning) << "Firmware image failed verification - abandoning update";
                     operation_->running_firmware_update = false;
                     checkAndUpdateStatus(ocpp1_6::FirmwareStatus::kInstallationFailed);
-                    operation_ = std::nullopt;
+                    clearOperation();
                     return;
                 } else if (chunk_result != StationInterface::Result::kSucceeded) {
                     CHARGELAB_LOG_MESSAGE(warning) << "Failed processing firmware chunk";
@@ -854,7 +928,7 @@ namespace chargelab {
                     CHARGELAB_LOG_MESSAGE(warning) << "Firmware image failed verification - abandoning update";
                     operation_->running_firmware_update = false;
                     checkAndUpdateStatus(ocpp1_6::FirmwareStatus::kInstallationFailed);
-                    operation_ = std::nullopt;
+                    clearOperation();
                     restoreConnector0OperativeIfNeeded();
                     return;
                 } else if (finish_result != StationInterface::Result::kSucceeded) {
@@ -868,7 +942,7 @@ namespace chargelab {
                 settings_->ExpectedUpdateFirmwareSlotId.setValueFromString(buildExpectedUpdateFirmwareSlotId(
                         operation_->request.requestId, slot_id));
 
-                operation_ = std::nullopt;
+                clearOperation();
                 restoreConnector0OperativeIfNeeded();
 
                 reset_->resetOnIdle(ocpp2_0::BootReasonEnumType::kFirmwareUpdate);

@@ -2020,6 +2020,25 @@ namespace chargelab {
                 [](auto const&) {return true;}
         };
 
+        /**
+         * Non-empty while a firmware update operation is in flight, so an update
+         * interrupted by a reboot can be reported to the CSMS on the way back up rather
+         * than leaving it waiting on a status that will never arrive. Holds the OCPP 2.0.1
+         * requestId; "0" for 1.6, which has no request id.
+         */
+        SettingString PendingFirmwareUpdateRequestId {
+                []() {
+                    return SettingMetadata {
+                            "PendingFirmwareUpdateRequestId",
+                            SettingConfig::roPolicy(),
+                            DeviceModel1_6 {"PendingFirmwareUpdateRequestId"},
+                            DeviceModel2_0 {{"CustomizationCtrlr"}, {"PendingFirmwareUpdateRequestId"}, {std::nullopt, ocpp2_0::DataEnumType::kstring}},
+                            ""
+                    };
+                },
+                [](auto const&) {return true;}
+        };
+
         SettingBool StopTransactionWithDifferentId {
                 []() {
                     return SettingMetadata {
@@ -3366,6 +3385,7 @@ namespace chargelab {
                     &OfflinePlugAndChargeToggle,
                     &OfflineThreshold,
                     &OrganizationName,
+                    &PendingFirmwareUpdateRequestId,
                     &PeriodsPerSchedule,
                     &PlugAndChargeId,
                     &ReservationAvailable,
