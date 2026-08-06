@@ -32,7 +32,13 @@ namespace chargelab {
             std::vector<uint8_t> buffer {};
             std::size_t content_length = 0;
             std::size_t total_bytes_read = 0;
+
+            // Consecutive failures - reset whenever the transfer makes forward progress, so
+            // a long download over a marginal link isn't killed by unrelated blips spread
+            // across the whole operation. The operation is bounded by deadline instead.
             std::size_t total_failures = 0;
+            std::optional<SteadyPointMillis> next_attempt_time = std::nullopt;
+            std::optional<SteadyPointMillis> deadline = std::nullopt;
 
             std::vector<std::vector<uint8_t>> block_hashes {};
             std::optional<std::vector<uint8_t>> expected_signature_hash = std::nullopt;
@@ -49,6 +55,17 @@ namespace chargelab {
     private:
         static constexpr int kChunkSize = 20*1024;
         static constexpr int kPriorityFirmwareStatusNotification = 100;
+
+        // Retry pacing used when the CSMS didn't specify a retryInterval: exponential
+        // backoff from kBaseRetryDelaySeconds, capped at kMaxRetryDelaySeconds.
+        static constexpr int kBaseRetryDelaySeconds = 10;
+        static constexpr int kMaxRetryDelaySeconds = 5*60;
+        static constexpr int kMaxBackoffShift = 5;
+
+        // Overall bound on a single update operation, started when the first transfer
+        // attempt is made. Replaces the attempt count as the thing that stops an update
+        // that can never succeed, now that failures reset on forward progress.
+        static constexpr std::int64_t kOperationTimeoutMillis = 60*60*1000;
 
         // Note: arbitrary random assigned ID
         static constexpr std::uint64_t kOperationGroupId = 0x78106033AC8E780Aull;
@@ -231,6 +248,79 @@ namespace chargelab {
         }
 
 
+        /**
+         * Records a failed attempt and schedules when the next one may start. The CSMS
+         * supplied retryInterval is honoured when present; otherwise the delay backs off
+         * exponentially. Without this the retry budget was spent in a handful of
+         * milliseconds and any transient outage looked permanent.
+         */
+        static void recordFailure(
+                std::shared_ptr<PlatformInterface> const& platform,
+                detail::FirmwareUpdateOperation<HM>& operation
+        ) {
+            operation.total_failures++;
+            operation.connection = nullptr;
+
+            int delay_seconds = optional::GetOrDefault(operation.request.retryInterval, 0);
+            if (delay_seconds <= 0) {
+                auto const shift = std::min<std::size_t>(operation.total_failures - 1, kMaxBackoffShift);
+                delay_seconds = std::min(kBaseRetryDelaySeconds << shift, kMaxRetryDelaySeconds);
+            }
+
+            operation.next_attempt_time = static_cast<SteadyPointMillis>(
+                    platform->steadyClockNow() + (std::int64_t)delay_seconds*1000
+            );
+            CHARGELAB_LOG_MESSAGE(info) << "Firmware update attempt failed (" << operation.total_failures
+                    << " consecutive) - retrying in " << delay_seconds << "s";
+        }
+
+        /**
+         * Records that the transfer moved forward, clearing the consecutive failure count
+         * so a long download over a marginal link can still complete.
+         */
+        static void recordProgress(detail::FirmwareUpdateOperation<HM>& operation) {
+            operation.total_failures = 0;
+            operation.next_attempt_time = std::nullopt;
+        }
+
+        /**
+         * @return true if the operation should be abandoned - either too many consecutive
+         *         failures, or the operation as a whole has run out of time.
+         */
+        bool operationExhausted(detail::FirmwareUpdateOperation<HM>& operation, int max_retries) {
+            auto const now = platform_->steadyClockNow();
+            if (!operation.deadline.has_value()) {
+                operation.deadline = static_cast<SteadyPointMillis>(now + kOperationTimeoutMillis);
+            }
+
+            if ((int)operation.total_failures > max_retries) {
+                return true;
+            }
+
+            if (now - operation.deadline.value() >= 0) {
+                CHARGELAB_LOG_MESSAGE(warning) << "Firmware update operation timed out - abandoning";
+                return true;
+            }
+
+            return false;
+        }
+
+        /**
+         * @return true if the operation is waiting out a retry backoff.
+         */
+        bool waitingForRetry(detail::FirmwareUpdateOperation<HM>& operation) {
+            if (!operation.next_attempt_time.has_value()) {
+                return false;
+            }
+
+            if (platform_->steadyClockNow() - operation.next_attempt_time.value() < 0) {
+                return true;
+            }
+
+            operation.next_attempt_time = std::nullopt;
+            return false;
+        }
+
         static bool checkOrRetryConnection(
                 std::shared_ptr<PlatformInterface> const& platform,
                 detail::FirmwareUpdateOperation<HM>& operation
@@ -243,29 +333,26 @@ namespace chargelab {
             operation.connection = platform->getRequest(uri);
             if (operation.connection == nullptr) {
                 CHARGELAB_LOG_MESSAGE(warning) << "Failed establishing connection to: " << uri;
-                operation.total_failures++;
+                recordFailure(platform, operation);
                 return false;
             }
 
             if (!operation.connection->open(0)) {
                 CHARGELAB_LOG_MESSAGE(warning) << "Failed opening connection to server";
-                operation.total_failures++;
-                operation.connection = nullptr;
+                recordFailure(platform, operation);
                 return false;
             }
 
             if (!operation.connection->send()) {
                 CHARGELAB_LOG_MESSAGE(warning) << "Failed sending request";
-                operation.total_failures++;
-                operation.connection = nullptr;
+                recordFailure(platform, operation);
                 return false;
             }
 
             auto const status = operation.connection->getStatusCode();
             if (!(status >= 200 && status < 300)) {
                 CHARGELAB_LOG_MESSAGE(warning) << "Bad status code - expecting 2xx response: " << status;
-                operation.total_failures++;
-                operation.connection = nullptr;
+                recordFailure(platform, operation);
                 return false;
             }
 
@@ -367,13 +454,16 @@ namespace chargelab {
             }
 
             if (!operation_->finished_signature_check) {
-                if ((int)operation_->total_failures > max_retries) {
+                if (operationExhausted(operation_.value(), max_retries)) {
                     checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kDownloadFailed);
                     operation_ = std::nullopt;
                     return;
                 }
 
                 checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kDownloading);
+                if (waitingForRetry(operation_.value()))
+                    return;
+
                 if (!checkOrRetryConnection(platform_, operation_.value()))
                     return;
 
@@ -388,8 +478,7 @@ namespace chargelab {
                     // those conditions.
                     if (bytes_read <= 0) {
                         CHARGELAB_LOG_MESSAGE(warning) << "Failed reading data - retrying operation";
-                        operation_->connection = nullptr;
-                        operation_->total_failures++;
+                        recordFailure(platform_, operation_.value());
                         return;
                     }
 
@@ -401,14 +490,14 @@ namespace chargelab {
                     );
                     if (!hash.has_value()) {
                         CHARGELAB_LOG_MESSAGE(error) << "Failed hashing block";
-                        operation_->connection = nullptr;
-                        operation_->total_failures++;
+                        recordFailure(platform_, operation_.value());
                         return;
                     }
 
                     operation_->block_hashes.push_back(std::move(hash.value()));
                     operation_->signature_hash->update((unsigned char const*)operation_->buffer.data(), bytes_read);
                     operation_->total_bytes_read += bytes_read;
+                    recordProgress(operation_.value());
                     CHARGELAB_LOG_MESSAGE(debug) << "Hashing progress: " << operation_->total_bytes_read << " / " << operation_->content_length;
                     station_->notifyUpdateProgress(
                             StationInterface::UpdatePhase::kDownloading,
@@ -507,13 +596,16 @@ namespace chargelab {
                     }
                 }
 
-                if ((int)operation_->total_failures > max_retries) {
+                if (operationExhausted(operation_.value(), max_retries)) {
                     checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInstallationFailed);
                     operation_ = std::nullopt;
                     return;
                 }
 
                 checkAndUpdateStatus(ocpp2_0::FirmwareStatusEnumType::kInstalling);
+                if (waitingForRetry(operation_.value()))
+                    return;
+
                 if (!checkOrRetryConnection(platform_, operation_.value()))
                     return;
 
@@ -525,8 +617,7 @@ namespace chargelab {
                     // those conditions.
                     if (bytes_read <= 0) {
                         CHARGELAB_LOG_MESSAGE(warning) << "Failed reading data - retrying operation";
-                        operation_->connection = nullptr;
-                        operation_->total_failures++;
+                        recordFailure(platform_, operation_.value());
                         return;
                     }
 
@@ -538,8 +629,7 @@ namespace chargelab {
 
                         if (station_->startUpdateProcess(operation_->content_length) != StationInterface::Result::kSucceeded) {
                             CHARGELAB_LOG_MESSAGE(warning) << "Failed starting firmware update process";
-                            operation_->connection = nullptr;
-                            operation_->total_failures++;
+                            recordFailure(platform_, operation_.value());
                             return;
                         }
 
@@ -548,8 +638,7 @@ namespace chargelab {
                         if (!operation_->running_firmware_update) {
                             CHARGELAB_LOG_MESSAGE(error)
                                 << "Unexpected state - expected running firmware update operation";
-                            operation_->connection = nullptr;
-                            operation_->total_failures++;
+                            recordFailure(platform_, operation_.value());
                             return;
                         }
                     }
@@ -563,13 +652,13 @@ namespace chargelab {
                         return;
                     } else if (chunk_result != StationInterface::Result::kSucceeded) {
                         CHARGELAB_LOG_MESSAGE(warning) << "Failed processing firmware chunk";
-                        operation_->connection = nullptr;
-                        operation_->total_failures++;
+                        recordFailure(platform_, operation_.value());
                         return;
                     }
 
                     operation_->signature_hash->update((unsigned char const*)operation_->buffer.data(), bytes_read);
                     operation_->total_bytes_read += bytes_read;
+                    recordProgress(operation_.value());
                     CHARGELAB_LOG_MESSAGE(debug) << "Flashing progress: " << operation_->total_bytes_read << " / " << operation_->content_length;
                 }
 
@@ -587,8 +676,7 @@ namespace chargelab {
                     } else if (finish_result != StationInterface::Result::kSucceeded) {
                         CHARGELAB_LOG_MESSAGE(warning) << "Failed finishing update process";
                         operation_->running_firmware_update = false;
-                        operation_->connection = nullptr;
-                        operation_->total_failures++;
+                        recordFailure(platform_, operation_.value());
                         return;
                     }
 
@@ -644,7 +732,7 @@ namespace chargelab {
                     settings_->FirmwareUpdateDefaultRetries.getValue()
             );
 
-            if ((int)operation_->total_failures > max_retries) {
+            if (operationExhausted(operation_.value(), max_retries)) {
                 if (operation_->content_length == 0 || operation_->content_length > operation_->total_bytes_read) {
                     checkAndUpdateStatus(ocpp1_6::FirmwareStatus::kDownloadFailed);
                 } else {
@@ -663,6 +751,9 @@ namespace chargelab {
                 }
             }
 
+            if (waitingForRetry(operation_.value()))
+                return;
+
             if (!checkOrRetryConnection(platform_, operation_.value()))
                 return;
 
@@ -674,8 +765,7 @@ namespace chargelab {
                 // those conditions.
                 if (bytes_read <= 0) {
                     CHARGELAB_LOG_MESSAGE(warning) << "Failed reading data - retrying operation";
-                    operation_->connection = nullptr;
-                    operation_->total_failures++;
+                    recordFailure(platform_, operation_.value());
                     return;
                 }
 
@@ -687,8 +777,7 @@ namespace chargelab {
 
                     if (station_->startUpdateProcess(operation_->content_length) != StationInterface::Result::kSucceeded) {
                         CHARGELAB_LOG_MESSAGE(warning) << "Failed starting firmware update process";
-                        operation_->connection = nullptr;
-                        operation_->total_failures++;
+                        recordFailure(platform_, operation_.value());
                         return;
                     }
 
@@ -697,8 +786,7 @@ namespace chargelab {
                     if (!operation_->running_firmware_update) {
                         CHARGELAB_LOG_MESSAGE(error)
                             << "Unexpected state - expected running firmware update operation";
-                        operation_->connection = nullptr;
-                        operation_->total_failures++;
+                        recordFailure(platform_, operation_.value());
                         return;
                     }
                 }
@@ -713,8 +801,7 @@ namespace chargelab {
                     return;
                 } else if (chunk_result != StationInterface::Result::kSucceeded) {
                     CHARGELAB_LOG_MESSAGE(warning) << "Failed processing firmware chunk";
-                    operation_->connection = nullptr;
-                    operation_->total_failures++;
+                    recordFailure(platform_, operation_.value());
                     return;
                 }
 
@@ -723,6 +810,7 @@ namespace chargelab {
                 //  What approach is expected here?
                 operation_->signature_hash->update((unsigned char const*)operation_->buffer.data(), bytes_read);
                 operation_->total_bytes_read += bytes_read;
+                recordProgress(operation_.value());
                 CHARGELAB_LOG_MESSAGE(debug) << "Flashing progress: " << operation_->total_bytes_read << " / " << operation_->content_length;
             }
 
@@ -750,8 +838,7 @@ namespace chargelab {
                 } else if (finish_result != StationInterface::Result::kSucceeded) {
                     CHARGELAB_LOG_MESSAGE(warning) << "Failed finishing update process";
                     operation_->running_firmware_update = false;
-                    operation_->connection = nullptr;
-                    operation_->total_failures++;
+                    recordFailure(platform_, operation_.value());
                     return;
                 }
 
