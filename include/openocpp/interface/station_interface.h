@@ -291,6 +291,20 @@ namespace chargelab {
          */
         virtual void notifyUpdateProgress(UpdatePhase phase, std::size_t bytes, std::size_t total) {}
 
+        /**
+         * Notifies the station of a firmware update status change, so it can keep a local
+         * record of an update the CSMS drove. Covers the parts of an update the rest of this
+         * interface never sees - a download that never connects, a server returning 404, the
+         * retry backoff - which would otherwise leave no trace once the station reboots.
+         * Default is a no-op.
+         *
+         * @param status the OCPP firmware status being reported, as a string
+         * @param detail context that doesn't fit the OCPP status (a server status code, how
+         *               long until the next attempt); may be empty
+         * @param is_failure true if the status reports the update going wrong
+         */
+        virtual void notifyUpdateStatus(std::string const& status, std::string const& detail, bool is_failure) {}
+
     public:
         /**
          * Helper method to lookup an OCPP 1.6 connector ID based on the provided metadata.
