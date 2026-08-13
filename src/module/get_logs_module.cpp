@@ -1,5 +1,8 @@
 #include "openocpp/module/get_logs_module.h"
 
+#include <algorithm>
+#include <cstdio>
+
 namespace chargelab {
 
 GetLogsModule::GetLogsModule(
@@ -13,23 +16,31 @@ GetLogsModule::GetLogsModule(
     settings_ = platform_->getSettings();
     assert(settings_ != nullptr);
 
+    // Note: this callback runs on whichever task emitted the log message, concurrently with
+    // flushLogMessages on the OCPP task. It must not allocate and must not block: log_buffer_ takes
+    // fixed-size, trivially copyable entries for exactly that reason.
     listener_ = std::make_shared<logging::LoggingListenerFunction>([&](logging::LogMetadata const& metadata, std::string_view const& message) {
-        std::string merged_message;
+        std::string_view prefix {};
 #if defined(LOG_WITH_FILE_AND_LINE)
-        merged_message += "[";
-        merged_message += metadata.file;
-        merged_message += ":";
-        merged_message += std::to_string(metadata.line);
-        merged_message += "]";
+        // Note: rendered into a stack buffer rather than a std::string to keep this path allocation free.
+        char prefix_buffer[64];
+        // Note: metadata.file is a string_view and is not guaranteed to be null terminated.
+        auto const written = std::snprintf(
+                prefix_buffer, sizeof(prefix_buffer), "[%.*s:%d]",
+                (int)metadata.file.size(), metadata.file.data(), metadata.line
+        );
+        if (written > 0) {
+            prefix = std::string_view {prefix_buffer, std::min((std::size_t)written, sizeof(prefix_buffer) - 1)};
+        }
 #endif
-        merged_message += message;
 
-        log_buffer_.pushBack(detail::LogLine{
+        log_buffer_.pushBack(
                 index_++,
                 platform_->systemClockNow(),
                 metadata.level,
-                std::move(merged_message)
-        });
+                prefix,
+                message
+        );
     });
 
     logging::RegisterLoggingListener(listener_); // register this callback to the global listener
@@ -41,6 +52,12 @@ GetLogsModule::GetLogsModule(
     CHARGELAB_LOG_MESSAGE(info) << "Size of buffer: " << sizeof(log_buffer_);
 }
 
+GetLogsModule::~GetLogsModule() {
+    // Note: the listener captures this by reference, so it has to be removed from the global list
+    // before the members it touches are destroyed.
+    logging::UnregisterLoggingListener(listener_);
+}
+
 void GetLogsModule::runUnconditionally() {
     reportQueueSize();
     uploadLogs();
@@ -48,12 +65,28 @@ void GetLogsModule::runUnconditionally() {
 }
 
 void GetLogsModule::flushLogMessages() {
+    // Note: this runs on the OCPP task. Entries are copied out of log_buffer_ as PODs and only then
+    // turned into heap-allocated LogLines, so the log-emitting tasks never allocate or take ownership.
+    LogBuffer::Entry entry {};
     for (int i=0; i < 10; i++) {
-        auto next = log_buffer_.popFront();
-        if (!next.has_value())
+        if (!log_buffer_.popFront(entry)) {
             break;
+        }
 
-        log_queue_.pushBack(std::move(next.value()));
+        std::string message {entry.text, (std::size_t)entry.length};
+        if (entry.truncated()) {
+            // Note: recorded inline so a truncated line is identifiable in the uploaded log itself,
+            // not just in the counters.
+            message += "...[+" + std::to_string(entry.truncated_bytes) + " bytes truncated]";
+            truncated_lines_++;
+        }
+
+        log_queue_.pushBack(detail::LogLine{
+                entry.message_index,
+                entry.timestamp,
+                entry.logLevel(),
+                std::move(message)
+        });
     }
 
     while (log_queue_.totalBytes() > kMaxRetainedLogMessagesBytes) {
@@ -150,6 +183,16 @@ void GetLogsModule::reportQueueSize() {
     }
 
     last_queue_size_report_ = now;
+
+    auto const dropped = log_buffer_.takeDropped();
+    if (dropped > 0) {
+        CHARGELAB_LOG_MESSAGE(warning) << "Dropped " << dropped << " log messages - buffer overran between flushes";
+    }
+    if (truncated_lines_ > 0) {
+        CHARGELAB_LOG_MESSAGE(warning) << "Truncated " << truncated_lines_ << " log messages longer than " << kMaxLogLineBytes << " bytes";
+        truncated_lines_ = 0;
+    }
+
     CHARGELAB_LOG_MESSAGE(info) << "Total log queue size: " << log_queue_.totalBytes();
 }
 

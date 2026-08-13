@@ -6,7 +6,7 @@
 #include "openocpp/protocol/common/small_string.h"
 #include "openocpp/interface/element/rest_connection_interface.h"
 #include "openocpp/interface/platform_interface.h"
-#include "openocpp/common/ring_buffer.h"
+#include "openocpp/common/log_message_queue.h"
 #include "openocpp/common/serialization.h"
 
 namespace chargelab {
@@ -73,7 +73,15 @@ namespace chargelab {
         static constexpr int kUploadStepMaxTimeMillis = 100;
         static constexpr int kPriorityLogStatusNotification = 100;
         static constexpr int kQueueReportFrequencySeconds = 10;
-        static constexpr int kMaxRingBufferSize = 5;
+
+        // Note: the log buffer is statically sized because it is written from the logging callback,
+        // which runs on arbitrary tasks and must not allocate. kMaxLogLineBytes is the truncation
+        // point for a single line.
+        static constexpr int kMaxRingBufferSize = 12;
+        // Note: Entry carries a 16 byte header, so 240 makes each slot exactly 256 bytes. Lines
+        // longer than this are truncated, and the overflow is recorded per line and rendered into
+        // the uploaded log rather than being dropped silently.
+        static constexpr int kMaxLogLineBytes = 240;
 
         // Note: arbitrary random assigned ID
         static constexpr std::uint64_t kOperationGroupId = 0xDB0A571F9D6E2A10ull;
@@ -83,6 +91,8 @@ namespace chargelab {
                 std::shared_ptr<PlatformInterface> platform,
                 std::shared_ptr<PendingMessagesModule> pending_messages
         );
+
+        ~GetLogsModule() override;
 
     private:
         void runUnconditionally() override;
@@ -112,7 +122,13 @@ namespace chargelab {
 
         std::optional<detail::UploadState> operation_ = std::nullopt;
         std::optional<SteadyPointMillis> last_queue_size_report_ = std::nullopt;
-        RingBuffer<detail::LogLine, kMaxRingBufferSize> log_buffer_;
+        using LogBuffer = LogMessageQueue<kMaxRingBufferSize, kMaxLogLineBytes>;
+        static_assert(sizeof(LogBuffer::Entry) == 256, "Log entries are sized to land on an exact 256 byte slot");
+
+        LogBuffer log_buffer_;
+
+        // Note: only touched from the consuming task, so it needs no synchronization.
+        int truncated_lines_ = 0;
 
         std::atomic<int> index_ = 0;
         CompressedQueueCustom<detail::LogLine, detail::LogLineSerializer> log_queue_;
