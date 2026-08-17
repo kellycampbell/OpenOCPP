@@ -230,6 +230,28 @@ namespace chargelab {
         [[nodiscard]] virtual std::optional<ocpp2_0::IdTokenType> readToken2_0() = 0;
 
         /**
+         * Result of a physical connector unlock attempt, requested remotely via the OCPP UnlockConnector
+         * operation (e.g. to release a stuck cable after a session ends).
+         */
+        enum class UnlockResult {
+            kUnlocked,
+            kUnlockFailed,
+            kNotSupported
+        };
+
+        /**
+         * Attempts to physically unlock the given connector. Default implementation reports the operation as
+         * unsupported; stations with a connector lock actuator should override this.
+         *
+         * @param evse the EVSE/connector to unlock
+         * @return the outcome of the unlock attempt
+         */
+        virtual UnlockResult unlockConnector(ocpp2_0::EVSEType const& evse) {
+            (void)evse;
+            return UnlockResult::kNotSupported;
+        }
+
+        /**
          * Gets the active firmware slot (generally some kind of partition ID). This is compared to the update slot to
          * determine whether or not the firmware update succeeded.
          *

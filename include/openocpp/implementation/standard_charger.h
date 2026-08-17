@@ -12,6 +12,7 @@
 #include "openocpp/module/configuration_module.h"
 #include "openocpp/module/fallback_module.h"
 #include "openocpp/module/reset_module.h"
+#include "openocpp/module/unlock_connector_module.h"
 #include "openocpp/module/firmware_update_module.h"
 #include "openocpp/module/power_management_module1_6.h"
 #include "openocpp/module/transaction_module1_6.h"
@@ -40,6 +41,7 @@ namespace chargelab {
         std::shared_ptr<ConfigurationModule> configuration_module;
         std::shared_ptr<FallbackModule> fallback_module;
         std::shared_ptr<ResetModule> reset_module;
+        std::shared_ptr<UnlockConnectorModule> unlock_connector_module;
         std::shared_ptr<FirmwareUpdateModule<HashMethodsMbedTLS>> firmware_update_module;
 
         std::shared_ptr<PowerManagementModule1_6> power_management_module1_6;
@@ -85,6 +87,7 @@ namespace chargelab {
             configuration_module = std::make_shared<ConfigurationModule>(notNull(settings), notNull(platform));
             fallback_module = std::make_shared<FallbackModule>(notNull(platform));
             reset_module = std::make_shared<ResetModule>(notNull(settings), notNull(platform), notNull(connector_status_module));
+            unlock_connector_module = std::make_shared<UnlockConnectorModule>(notNull(station), notNull(connector_status_module));
 
             // TODO: Maybe hash methods should move into platform?
             firmware_update_module = std::make_shared<FirmwareUpdateModule<HashMethodsMbedTLS>>(
@@ -122,6 +125,7 @@ namespace chargelab {
                             notNull(heartbeat_module),
                             notNull(configuration_module),
                             notNull(reset_module),
+                            notNull(unlock_connector_module),
                             notNull(connector_status_module),
                             notNull(pending_messages_module),
                             notNull(firmware_update_module),
@@ -169,6 +173,7 @@ namespace chargelab {
                             heartbeat_module,
                             configuration_module,
                             reset_module,
+                            unlock_connector_module,
                             connector_status_module,
                             pending_messages_module,
                             firmware_update_module,
