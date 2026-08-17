@@ -1813,6 +1813,7 @@ namespace chargelab {
                             SettingConfig::rwPolicy(),
                             DeviceModel1_6 {"UnlockConnectorOnEVSideDisconnect"},
                             DeviceModel2_0 {{"OCPPCommCtrlr"}, {"UnlockOnEVSideDisconnect"}, {std::nullopt, ocpp2_0::DataEnumType::kboolean}},
+                            // Yes, this config var is listed on the OCPPCommCtrlr in the 2.0.1 and 2.1 spec even though that seems like a weird component for it.
                             SettingBool::kTextFalse
                     };
                 },
