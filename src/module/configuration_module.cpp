@@ -73,6 +73,58 @@ void ConfigurationModule::runStep(ocpp2_0::OcppRemote &remote) {
             ocpp2_0_pending_base_report_ = std::nullopt;
         }
     }
+
+    if (ocpp2_0_pending_monitoring_report_.has_value()) {
+        auto const& request = ocpp2_0_pending_monitoring_report_.value();
+
+        // Group individual monitors by component+variable, per the MonitoringDataType shape.
+        std::vector<ocpp2_0::MonitoringDataType> grouped;
+        for (auto const& monitor : monitors_) {
+            if (request.componentVariable.has_value()) {
+                bool matched = false;
+                for (auto const& filter : request.componentVariable.value()) {
+                    if (filter.component != monitor.component)
+                        continue;
+                    if (filter.variable.has_value() && filter.variable.value() != monitor.variable)
+                        continue;
+
+                    matched = true;
+                    break;
+                }
+
+                if (!matched)
+                    continue;
+            }
+
+            auto entry = std::find_if(grouped.begin(), grouped.end(), [&](ocpp2_0::MonitoringDataType const& x) {
+                return x.component == monitor.component && x.variable == monitor.variable;
+            });
+            if (entry == grouped.end()) {
+                grouped.push_back(ocpp2_0::MonitoringDataType {monitor.component, monitor.variable, {}});
+                entry = std::prev(grouped.end());
+            }
+
+            entry->variableMonitoring.push_back(ocpp2_0::VariableMonitoringType {
+                    monitor.id,
+                    monitor.transaction,
+                    monitor.value,
+                    monitor.type,
+                    monitor.severity
+            });
+        }
+
+        ocpp2_0::NotifyMonitoringReportRequest response {
+                request.requestId,
+                false,
+                0,
+                {system_->systemClockNow()},
+                std::move(grouped)
+        };
+
+        if (remote.sendNotifyMonitoringReportReq(response).has_value()) {
+            ocpp2_0_pending_monitoring_report_ = std::nullopt;
+        }
+    }
 }
 
 std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::GetVariablesResponse>>
@@ -478,8 +530,185 @@ ConfigurationModule::onSetNetworkProfileReq(const ocpp2_0::SetNetworkProfileRequ
 }
 
 std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::GetMonitoringReportResponse>>
-ConfigurationModule::onGetMonitoringReportReq(const ocpp2_0::GetMonitoringReportRequest&) {
-    return ocpp2_0::GetMonitoringReportResponse {ocpp2_0::GenericDeviceModelStatusEnumType::kEmptyResultSet};
+ConfigurationModule::onGetMonitoringReportReq(const ocpp2_0::GetMonitoringReportRequest& request) {
+    if (ocpp2_0_pending_monitoring_report_.has_value()) {
+        return ocpp2_0::GetMonitoringReportResponse {
+                ocpp2_0::GenericDeviceModelStatusEnumType::kRejected
+        };
+    }
+
+    // Only ThresholdMonitoring/DeltaMonitoring/PeriodicMonitoring criteria filter by monitor type; since we
+    // don't distinguish "custom" vs "pre-configured" monitors here, any requested criteria is honoured by
+    // simply checking the monitor type below rather than rejecting the request up front.
+
+    if (monitors_.empty()) {
+        return ocpp2_0::GetMonitoringReportResponse {
+                ocpp2_0::GenericDeviceModelStatusEnumType::kEmptyResultSet
+        };
+    }
+
+    ocpp2_0_pending_monitoring_report_ = request;
+    return ocpp2_0::GetMonitoringReportResponse {
+            ocpp2_0::GenericDeviceModelStatusEnumType::kAccepted
+    };
+}
+
+std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::SetVariableMonitoringResponse>>
+ConfigurationModule::onSetVariableMonitoringReq(const ocpp2_0::SetVariableMonitoringRequest &request) {
+    if ((int)request.setMonitoringData.size() > settings_->ItemsPerMessageSetVariableMonitoring.getValue()) {
+        return ocpp2_0::CallError {
+                ocpp2_0::ErrorCode::kOccurrenceConstraintViolation,
+                {"Exceeded ItemsPerMessageSetVariableMonitoring limit"},
+                common::RawJson::empty_object()
+        };
+    }
+
+    std::vector<ocpp2_0::SetMonitoringResultType> results;
+    for (auto const& set_monitoring : request.setMonitoringData) {
+        bool componentFound = false;
+        bool variableFound = false;
+        bool variableMonitorable = false;
+
+        auto result = ocpp2_0::SetMonitoringResultType {
+                set_monitoring.id,
+                ocpp2_0::SetMonitoringStatusEnumType::kUnknownComponent,
+                set_monitoring.type,
+                set_monitoring.severity,
+                set_monitoring.component,
+                set_monitoring.variable
+        };
+
+        settings_->visitSettings([&](SettingBase& setting) {
+            if (variableFound)
+                return;
+
+            auto const metadata = setting.getMetadata();
+            if (!metadata.model2_0.has_value())
+                return;
+
+            if (metadata.model2_0->component_type != set_monitoring.component)
+                return;
+            componentFound = true;
+
+            if (metadata.model2_0->variable_type != set_monitoring.variable)
+                return;
+            variableFound = true;
+
+            // Only variables the CSMS is allowed to read make sense to monitor.
+            variableMonitorable = metadata.config.isAllowOcppRead();
+        });
+
+        if (!componentFound) {
+            result.status = ocpp2_0::SetMonitoringStatusEnumType::kUnknownComponent;
+        } else if (!variableFound) {
+            result.status = ocpp2_0::SetMonitoringStatusEnumType::kUnknownVariable;
+        } else if (!variableMonitorable) {
+            result.status = ocpp2_0::SetMonitoringStatusEnumType::kRejected;
+        } else {
+            MonitorRecord* existing = nullptr;
+            if (set_monitoring.id.has_value()) {
+                for (auto& monitor : monitors_) {
+                    if (monitor.id == set_monitoring.id.value()) {
+                        existing = &monitor;
+                        break;
+                    }
+                }
+
+                if (existing == nullptr) {
+                    result.status = ocpp2_0::SetMonitoringStatusEnumType::kRejected;
+                    result.statusInfo = ocpp2_0::StatusInfoType {{"UnknownMonitorId"}};
+                }
+            }
+
+            if (existing == nullptr && result.status == ocpp2_0::SetMonitoringStatusEnumType::kUnknownComponent) {
+                // Duplicate check (B08.FR.14): reject a brand-new monitor that exactly matches an existing one.
+                for (auto const& monitor : monitors_) {
+                    if (monitor.component == set_monitoring.component &&
+                        monitor.variable == set_monitoring.variable &&
+                        monitor.type == set_monitoring.type &&
+                        monitor.severity == set_monitoring.severity) {
+                        result.status = ocpp2_0::SetMonitoringStatusEnumType::kDuplicate;
+                        break;
+                    }
+                }
+            }
+
+            if (result.status == ocpp2_0::SetMonitoringStatusEnumType::kUnknownComponent) {
+                if (existing == nullptr && monitors_.size() >= kMaxVariableMonitors) {
+                    result.status = ocpp2_0::SetMonitoringStatusEnumType::kRejected;
+                    result.statusInfo = ocpp2_0::StatusInfoType {{"TooManyMonitors"}};
+                } else {
+                    if (existing == nullptr) {
+                        monitors_.push_back(MonitorRecord {});
+                        existing = &monitors_.back();
+                        existing->id = next_monitor_id_++;
+                    }
+
+                    existing->component = set_monitoring.component;
+                    existing->variable = set_monitoring.variable;
+                    existing->transaction = set_monitoring.transaction.value_or(false);
+                    existing->value = set_monitoring.value;
+                    existing->type = set_monitoring.type;
+                    existing->severity = set_monitoring.severity;
+
+                    result.id = existing->id;
+                    result.status = ocpp2_0::SetMonitoringStatusEnumType::kAccepted;
+                }
+            }
+        }
+
+        results.push_back(std::move(result));
+    }
+
+    return ocpp2_0::SetVariableMonitoringResponse {std::move(results)};
+}
+
+std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::ClearVariableMonitoringResponse>>
+ConfigurationModule::onClearVariableMonitoringReq(const ocpp2_0::ClearVariableMonitoringRequest &request) {
+    std::vector<ocpp2_0::ClearMonitoringResultType> results;
+    for (auto const& id : request.id) {
+        auto it = std::find_if(monitors_.begin(), monitors_.end(), [&](MonitorRecord const& monitor) {
+            return monitor.id == id;
+        });
+
+        if (it == monitors_.end()) {
+            results.push_back(ocpp2_0::ClearMonitoringResultType {
+                    ocpp2_0::ClearMonitoringStatusEnumType::kNotFound,
+                    id
+            });
+        } else {
+            monitors_.erase(it);
+            results.push_back(ocpp2_0::ClearMonitoringResultType {
+                    ocpp2_0::ClearMonitoringStatusEnumType::kAccepted,
+                    id
+            });
+        }
+    }
+
+    return ocpp2_0::ClearVariableMonitoringResponse {std::move(results)};
+}
+
+std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::SetMonitoringBaseResponse>>
+ConfigurationModule::onSetMonitoringBaseReq(const ocpp2_0::SetMonitoringBaseRequest &request) {
+    // FactoryDefault/HardWiredOnly would normally reset to a charger-defined baseline set of monitors; since we
+    // don't ship any pre-configured monitors, all three bases behave the same way here - only "All" additionally
+    // permits CSMS-defined custom monitors to keep reporting, which matches monitors_ being CSMS-managed only.
+    monitoring_base_ = request.monitoringBase;
+    if (request.monitoringBase != ocpp2_0::MonitoringBaseEnumType::kAll) {
+        monitors_.clear();
+    }
+
+    return ocpp2_0::SetMonitoringBaseResponse {ocpp2_0::GenericDeviceModelStatusEnumType::kAccepted};
+}
+
+std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::SetMonitoringLevelResponse>>
+ConfigurationModule::onSetMonitoringLevelReq(const ocpp2_0::SetMonitoringLevelRequest &request) {
+    if (request.severity < 0 || request.severity > 9) {
+        return ocpp2_0::SetMonitoringLevelResponse {ocpp2_0::GenericStatusEnumType::kRejected};
+    }
+
+    monitoring_level_ = request.severity;
+    return ocpp2_0::SetMonitoringLevelResponse {ocpp2_0::GenericStatusEnumType::kAccepted};
 }
 
 } // namespace chargelab

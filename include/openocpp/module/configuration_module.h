@@ -52,6 +52,31 @@ namespace chargelab {
         std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::GetMonitoringReportResponse>>
         onGetMonitoringReportReq(const ocpp2_0::GetMonitoringReportRequest&) override;
 
+        std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::SetVariableMonitoringResponse>>
+        onSetVariableMonitoringReq(const ocpp2_0::SetVariableMonitoringRequest &request) override;
+
+        std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::ClearVariableMonitoringResponse>>
+        onClearVariableMonitoringReq(const ocpp2_0::ClearVariableMonitoringRequest &request) override;
+
+        std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::SetMonitoringBaseResponse>>
+        onSetMonitoringBaseReq(const ocpp2_0::SetMonitoringBaseRequest &request) override;
+
+        std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::SetMonitoringLevelResponse>>
+        onSetMonitoringLevelReq(const ocpp2_0::SetMonitoringLevelRequest &request) override;
+
+    private:
+        // A single variable monitor as tracked by this charging station (B08). Not yet persisted across
+        // reboots - see the TODO on monitors_ below.
+        struct MonitorRecord {
+            int id {};
+            ocpp2_0::ComponentType component {};
+            ocpp2_0::VariableType variable {};
+            bool transaction {};
+            double value {};
+            ocpp2_0::MonitorEnumType type {};
+            int severity {};
+        };
+
     private:
         template<int N>
         static bool ciEquals(ocpp2_0::IdentifierStringPrimitive<N> const& lhs, ocpp2_0::IdentifierStringPrimitive<N> const& rhs) {
@@ -73,6 +98,16 @@ namespace chargelab {
         std::shared_ptr<SystemInterface> system_;
 
         std::optional<ocpp2_0::GetBaseReportRequest> ocpp2_0_pending_base_report_ = std::nullopt;
+        std::optional<ocpp2_0::GetMonitoringReportRequest> ocpp2_0_pending_monitoring_report_ = std::nullopt;
+
+        // TODO: Persist across reboots (e.g. as a delimited-list Setting, similar to NetworkConnectionProfiles)
+        // once the monitor evaluation/NotifyEvent pipeline exists to make that worthwhile.
+        std::vector<MonitorRecord> monitors_ {};
+        int next_monitor_id_ = 1;
+        ocpp2_0::MonitoringBaseEnumType monitoring_base_ = ocpp2_0::MonitoringBaseEnumType::kAll;
+        int monitoring_level_ = 9;
+
+        static constexpr std::size_t kMaxVariableMonitors = 64;
     };
 }
 
