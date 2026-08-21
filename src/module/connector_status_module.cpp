@@ -455,6 +455,18 @@ ocpp2_0::ConnectorStatusEnumType ConnectorStatusModule::getStatus2_0(ocpp2_0::EV
     return ocpp2_0::ConnectorStatusEnumType::kAvailable;
 }
 
+std::string ConnectorStatusModule::getChargingState(std::optional<charger::ConnectorStatus> const& status) {
+    if (!status.has_value() || !status->vehicle_connected)
+        return "Idle";
+    if (!status->charging_enabled)
+        return "EVConnected";
+    if (status->suspended_by_charger)
+        return "SuspendedEVSE";
+    if (status->suspended_by_vehicle)
+        return "SuspendedEV";
+    return "Charging";
+}
+
 ocpp1_6::ChargePointStatus ConnectorStatusModule::getStatus1_6(ocpp2_0::EVSEType const& evse, charger::ConnectorStatus const& current, bool was_charging) {
     if (current.faulted_status.has_value())
         return ocpp1_6::ChargePointStatus::kFaulted;
@@ -736,6 +748,36 @@ void ConnectorStatusModule::addAndUpdateStateSettings() {
         });
 
         power.setValue(entry.second.power_max_watts);
+
+        // 2.13.9 (OCPP 2.1)
+        auto& charging_state = getOrCreateSetting(settings_charging_state_, entry.first, [&]() {
+            auto const& name = "EVSE" + std::to_string(entry.first.id) + "ChargingState";
+            return std::make_shared<SettingString>(
+                    std::make_unique<SettingMetadata>(SettingMetadata {
+                            name,
+                            SettingConfig::roNotSavedPolicy(),
+                            std::nullopt,
+                            DeviceModel2_0{
+                                    ocpp2_0::ComponentType{"EVSE", std::nullopt, ocpp2_0::EVSEType{entry.first.id}},
+                                    ocpp2_0::VariableType{"ChargingState"},
+                                    ocpp2_0::VariableCharacteristicsType{
+                                            std::nullopt,
+                                            ocpp2_0::DataEnumType::kOptionList,
+                                            std::nullopt,
+                                            std::nullopt,
+                                            "Charging,EVConnected,SuspendedEV,SuspendedEVSE,Idle"
+                                    }
+                            },
+                            "Idle"
+                    }),
+                    [](auto const&) {return true;}
+            );
+        });
+
+        // This module models a single connector per EVSE, so the EVSE's charging state is just
+        // that of its sole connector.
+        auto const& evse_connector_status = station_->pollConnectorStatus(ocpp2_0::EVSEType{entry.first.id, 1});
+        charging_state.setValue(getChargingState(evse_connector_status));
     }
 }
 

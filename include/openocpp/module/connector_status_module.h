@@ -79,6 +79,10 @@ namespace chargelab {
         ocpp2_0::ConnectorStatusEnumType getStatus2_0(ocpp2_0::EVSEType const& evse, charger::ConnectorStatus const& status);
         ocpp1_6::ChargePointStatus getStatus1_6(ocpp2_0::EVSEType const& evse, charger::ConnectorStatus const& current, bool was_charging);
 
+        // Maps a connector's live status onto the EVSE component's ChargingState device model
+        // variable (OCPP 2.1, ChargingStateEnumType), used to populate the EVSEChargingState.
+        std::string getChargingState(std::optional<charger::ConnectorStatus> const& status);
+
         template <typename Map, typename Key, typename Generator>
         auto& getOrCreateSetting(Map& map, Key&& key, Generator&& generator) {
             auto it = map.find(key);
@@ -115,6 +119,7 @@ namespace chargelab {
         std::map<chargelab::ocpp2_0::EVSEType, std::shared_ptr<SettingString>> settings_connector_type_ {};
         std::map<chargelab::ocpp2_0::EVSEType, std::shared_ptr<SettingInt>> settings_supply_phases_ {};
         std::map<chargelab::ocpp2_0::EVSEType, std::shared_ptr<SettingDouble>> settings_power_ {};
+        std::map<chargelab::ocpp2_0::EVSEType, std::shared_ptr<SettingString>> settings_charging_state_ {};
 
         // For portal module
         std::unordered_map<int, ocpp1_6::ChargePointStatus> last_charge_point_status_map1_6_ {};
