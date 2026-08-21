@@ -48,8 +48,12 @@ namespace chargelab {
             bool suspended_by_charger;
             double meter_watt_hours;
             std::optional<FaultedStatus> faulted_status = std::nullopt;
+            // Connector component's ChargeProtocol device model variable (OCPP 2.1): the charging
+            // control protocol currently in use, e.g. "CPPWM", "ISO15118", "CHAdeMO", "Uncontrolled",
+            // "Undetermined", "Unknown". Left unset to report "Undetermined".
+            std::optional<std::string> charge_protocol = std::nullopt;
             CHARGELAB_JSON_INTRUSIVE(ConnectorStatus, connector_available, vehicle_connected, charging_enabled, suspended_by_vehicle,
-                                     suspended_by_charger, faulted_status)
+                                     suspended_by_charger, faulted_status, charge_protocol)
         };
 
         struct ConnectorMetadata {

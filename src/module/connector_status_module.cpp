@@ -605,6 +605,34 @@ void ConnectorStatusModule::addAndUpdateStateSettings() {
         });
         connector_type.setValue(entry.second.connector_type);
 
+        // ChargeProtocol (OCPP 2.1) - reflects the Connector's currently active charging control
+        // protocol; distinct from and orthogonal to ConnectorType. Reported dynamically per
+        // pollConnectorStatus() rather than as static metadata, since a given connector may
+        // switch between CPPWM and ISO15118 depending on the vehicle it's serving.
+        auto& charge_protocol = getOrCreateSetting(settings_charge_protocol_, entry.first, [&]() {
+            auto const& name = "EVSE" + std::to_string(evse_id) + "Connector" + std::to_string(connector_id) + "ChargeProtocol";
+            return std::make_shared<SettingString>(
+                    std::make_unique<SettingMetadata>(SettingMetadata {
+                            name,
+                            SettingConfig::roNotSavedPolicy(),
+                            std::nullopt,
+                            DeviceModel2_0{
+                                    ocpp2_0::ComponentType{"Connector", std::nullopt, ocpp2_0::EVSEType{evse_id, connector_id}},
+                                    ocpp2_0::VariableType{"ChargeProtocol"},
+                                    ocpp2_0::VariableCharacteristicsType{std::nullopt, ocpp2_0::DataEnumType::kstring}
+                            },
+                            "Undetermined"
+                    }),
+                    [](auto const&) {return true;}
+            );
+        });
+
+        if (connector_status.has_value() && connector_status->charge_protocol.has_value()) {
+            charge_protocol.setValue(connector_status->charge_protocol.value());
+        } else {
+            charge_protocol.setValue("Undetermined");
+        }
+
         // 2.13.6
         auto& supply_phases = getOrCreateSetting(settings_supply_phases_, entry.first, [&]() {
             auto const& name = "EVSE" + std::to_string(evse_id) + "Connector" + std::to_string(connector_id) + "SupplyPhases";
@@ -749,7 +777,7 @@ void ConnectorStatusModule::addAndUpdateStateSettings() {
 
         power.setValue(entry.second.power_max_watts);
 
-        // 2.13.9 (OCPP 2.1)
+        // ChargingState (OCPP 2.1)
         auto& charging_state = getOrCreateSetting(settings_charging_state_, entry.first, [&]() {
             auto const& name = "EVSE" + std::to_string(entry.first.id) + "ChargingState";
             return std::make_shared<SettingString>(

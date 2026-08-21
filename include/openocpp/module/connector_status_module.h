@@ -117,6 +117,7 @@ namespace chargelab {
         std::map<chargelab::ocpp2_0::EVSEType, std::shared_ptr<SettingBool>> settings_available_ {};
         std::map<chargelab::ocpp2_0::EVSEType, std::shared_ptr<SettingString>> settings_availability_state_ {};
         std::map<chargelab::ocpp2_0::EVSEType, std::shared_ptr<SettingString>> settings_connector_type_ {};
+        std::map<chargelab::ocpp2_0::EVSEType, std::shared_ptr<SettingString>> settings_charge_protocol_ {};
         std::map<chargelab::ocpp2_0::EVSEType, std::shared_ptr<SettingInt>> settings_supply_phases_ {};
         std::map<chargelab::ocpp2_0::EVSEType, std::shared_ptr<SettingDouble>> settings_power_ {};
         std::map<chargelab::ocpp2_0::EVSEType, std::shared_ptr<SettingString>> settings_charging_state_ {};
