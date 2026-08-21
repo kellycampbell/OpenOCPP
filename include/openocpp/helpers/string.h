@@ -6,6 +6,7 @@
 #include <optional>
 #include <limits.h>
 #include <cstdint>
+#include <cstdio>
 #include <type_traits>
 
 namespace chargelab::string {
@@ -86,6 +87,14 @@ namespace chargelab::string {
         }
 
         return result;
+    }
+
+    // std::to_string(double) always pads to 6 decimal places (e.g. "7702.400000"); this formats
+    // to exactly `precision` decimal places instead (precision=0 gives "7702", no decimal point).
+    inline std::string FormatDouble(double value, int precision) {
+        char buffer[64];
+        std::snprintf(buffer, sizeof(buffer), "%.*f", precision, value);
+        return std::string(buffer);
     }
 
     template<typename T>

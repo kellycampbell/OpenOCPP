@@ -673,7 +673,8 @@ void ConnectorStatusModule::addAndUpdateStateSettings() {
                             },
                             std::to_string(0)
                     }),
-                    [](auto const&) {return true;}
+                    [](auto const&) {return true;},
+                    0
             );
         });
 
@@ -771,7 +772,8 @@ void ConnectorStatusModule::addAndUpdateStateSettings() {
                             },
                             std::to_string(0)
                     }),
-                    [](auto const&) {return true;}
+                    [](auto const&) {return true;},
+                    0
             );
         });
 

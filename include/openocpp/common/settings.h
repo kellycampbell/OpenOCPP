@@ -768,9 +768,10 @@ namespace chargelab {
 
     public:
         virtual ~SettingDouble() = default;
-        explicit SettingDouble(metadata_container_type metadata, validator_type validator)
+        explicit SettingDouble(metadata_container_type metadata, validator_type validator, int precision = 6)
                 : SettingBase(std::move(metadata)),
-                  validator_(validator)
+                  validator_(validator),
+                  precision_(precision)
         {
             if (!setValueFromString(getMetadata().default_value)) {
                 CHARGELAB_LOG_MESSAGE(error) << "Failed setting default value for: " << getId();
@@ -810,7 +811,7 @@ namespace chargelab {
         }
 
         [[nodiscard]] std::string getValueAsString() const override {
-            return std::to_string(getValue());
+            return string::FormatDouble(getValue(), precision_);
         }
 
         bool load(const std::string &value) override {
@@ -836,6 +837,7 @@ namespace chargelab {
 
     private:
         validator_type validator_;
+        int precision_;
 
         value_type current_value_;
     };
