@@ -637,7 +637,7 @@ void ConnectorStatusModule::addAndUpdateStateSettings() {
             );
         });
 
-        power.setValue(0);
+        power.setValue(entry.second.power_max_watts);
     }
 
     // Update EVSE level settings
@@ -735,7 +735,7 @@ void ConnectorStatusModule::addAndUpdateStateSettings() {
             );
         });
 
-        power.setValue(0);
+        power.setValue(entry.second.power_max_watts);
     }
 }
 
