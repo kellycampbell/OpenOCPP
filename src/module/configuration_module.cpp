@@ -125,6 +125,160 @@ void ConfigurationModule::runStep(ocpp2_0::OcppRemote &remote) {
             ocpp2_0_pending_monitoring_report_ = std::nullopt;
         }
     }
+
+    evaluateMonitors();
+
+    if (!pending_events_.empty()) {
+        ocpp2_0::NotifyEventRequest request {
+                {system_->systemClockNow()},
+                false,
+                0,
+                pending_events_
+        };
+
+        if (remote.sendNotifyEventReq(request).has_value()) {
+            pending_events_.clear();
+        }
+    }
+}
+
+std::optional<ConfigurationModule::MonitoredValue>
+ConfigurationModule::readMonitoredValue(MonitorRecord const& monitor) const {
+    std::optional<MonitoredValue> result;
+    settings_->visitSettings([&](SettingBase& setting) {
+        if (result.has_value())
+            return;
+
+        auto const metadata = setting.getMetadata();
+        if (!metadata.model2_0.has_value())
+            return;
+        if (metadata.model2_0->component_type != monitor.component)
+            return;
+        if (metadata.model2_0->variable_type != monitor.variable)
+            return;
+
+        MonitoredValue value;
+        value.text = setting.getValueAsString();
+
+        // B08.FR.10: numeric comparison only applies to decimal/integer variables - Delta on boolean/string/
+        // enumeration variables instead triggers on any change (handled in evaluateMonitors), and
+        // UpperThreshold/LowerThreshold/Periodic simply won't match a non-numeric variable's semantics.
+        auto const data_type = metadata.model2_0->variable_characteristics.dataType;
+        if (data_type == ocpp2_0::DataEnumType::kdecimal || data_type == ocpp2_0::DataEnumType::kinteger) {
+            value.numeric = string::ToDouble(value.text);
+        }
+
+        result = std::move(value);
+    });
+
+    return result;
+}
+
+void ConfigurationModule::raiseMonitorEvent(
+        MonitorRecord const& monitor,
+        std::string const& actual_value,
+        bool cleared
+) {
+    // B08.FR.13: suppress events below the configured monitoring level (0 is most severe).
+    if (monitor.severity > monitoring_level_)
+        return;
+
+    ocpp2_0::EventDataType event {};
+    event.eventId = next_event_id_++;
+    event.timestamp = {system_->systemClockNow()};
+    event.trigger = (monitor.type == ocpp2_0::MonitorEnumType::kDelta)
+            ? ocpp2_0::EventTriggerEnumType::kDelta
+            : (monitor.type == ocpp2_0::MonitorEnumType::kPeriodic ||
+               monitor.type == ocpp2_0::MonitorEnumType::kPeriodicClockAligned)
+                    ? ocpp2_0::EventTriggerEnumType::kPeriodic
+                    : ocpp2_0::EventTriggerEnumType::kAlerting;
+    event.actualValue = {actual_value};
+    event.cleared = cleared;
+    event.variableMonitoringId = monitor.id;
+    // These monitors are always CSMS-defined (SetVariableMonitoring), never charger-preconfigured.
+    event.eventNotificationType = ocpp2_0::EventNotificationEnumType::kCustomMonitor;
+    event.component = monitor.component;
+    event.variable = monitor.variable;
+
+    pending_events_.push_back(std::move(event));
+}
+
+void ConfigurationModule::evaluateMonitors() {
+    auto const now = system_->steadyClockNow();
+
+    for (auto& monitor : monitors_) {
+        auto const actual_value = readMonitoredValue(monitor);
+        if (!actual_value.has_value())
+            continue;
+
+        switch (monitor.type) {
+            case ocpp2_0::MonitorEnumType::kUpperThreshold:
+            case ocpp2_0::MonitorEnumType::kLowerThreshold: {
+                // Threshold comparisons are only meaningful for numeric variables.
+                if (!actual_value->numeric.has_value())
+                    continue;
+                double const value = actual_value->numeric.value();
+
+                bool const is_upper = (monitor.type == ocpp2_0::MonitorEnumType::kUpperThreshold);
+                double const margin = std::max(std::abs(monitor.value) * kThresholdHysteresisFraction, kThresholdMinHysteresis);
+
+                bool const past_activate = is_upper ? (value > monitor.value) : (value < monitor.value);
+                bool const past_clear = is_upper ? (value <= monitor.value - margin) : (value >= monitor.value + margin);
+
+                bool const debounced = monitor.threshold_debounce_until != SteadyPointMillis{} &&
+                        now < monitor.threshold_debounce_until;
+                if (debounced)
+                    continue;
+
+                if (past_activate && !monitor.threshold_active) {
+                    monitor.threshold_active = true;
+                    monitor.threshold_debounce_until = SteadyPointMillis{now + kThresholdDebounceMillis};
+                    raiseMonitorEvent(monitor, actual_value->text, false);
+                } else if (past_clear && monitor.threshold_active) {
+                    monitor.threshold_active = false;
+                    monitor.threshold_debounce_until = SteadyPointMillis{now + kThresholdDebounceMillis};
+                    raiseMonitorEvent(monitor, actual_value->text, true);
+                }
+                break;
+            }
+
+            case ocpp2_0::MonitorEnumType::kDelta: {
+                // B08.FR spec: numeric variables trigger once the value has moved +/- monitorValue since the
+                // last report; non-numeric variables (boolean/string/enumeration) trigger on any change,
+                // regardless of monitorValue.
+                bool triggered;
+                if (actual_value->numeric.has_value()) {
+                    triggered = !monitor.has_last_reported_value ||
+                            std::abs(actual_value->numeric.value() - monitor.last_reported_value) >= monitor.value;
+                } else {
+                    triggered = !monitor.has_last_reported_value ||
+                            monitor.last_reported_text != actual_value->text;
+                }
+
+                if (triggered) {
+                    monitor.has_last_reported_value = true;
+                    monitor.last_reported_value = actual_value->numeric.value_or(0);
+                    monitor.last_reported_text = actual_value->text;
+                    raiseMonitorEvent(monitor, actual_value->text, false);
+                }
+                break;
+            }
+
+            case ocpp2_0::MonitorEnumType::kPeriodic:
+            case ocpp2_0::MonitorEnumType::kPeriodicClockAligned: {
+                // TODO: PeriodicClockAligned should align to wall-clock boundaries (e.g. top of the hour for a
+                // 3600s interval) rather than time-since-first-evaluation; treated the same as Periodic for now.
+                if (monitor.next_periodic_report == SteadyPointMillis{} || now >= monitor.next_periodic_report) {
+                    monitor.next_periodic_report = SteadyPointMillis{now + (int64_t)monitor.value * 1000};
+                    raiseMonitorEvent(monitor, actual_value->text, false);
+                }
+                break;
+            }
+
+            default:
+                break;
+        }
+    }
 }
 
 std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::GetVariablesResponse>>
@@ -650,6 +804,13 @@ ConfigurationModule::onSetVariableMonitoringReq(const ocpp2_0::SetVariableMonito
                     existing->value = set_monitoring.value;
                     existing->type = set_monitoring.type;
                     existing->severity = set_monitoring.severity;
+
+                    // Reset evaluation state - a changed threshold/interval shouldn't reuse stale tracking.
+                    existing->threshold_active = false;
+                    existing->threshold_debounce_until = SteadyPointMillis {};
+                    existing->has_last_reported_value = false;
+                    existing->last_reported_text.clear();
+                    existing->next_periodic_report = SteadyPointMillis {};
 
                     result.id = existing->id;
                     result.status = ocpp2_0::SetMonitoringStatusEnumType::kAccepted;
