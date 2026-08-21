@@ -6,6 +6,7 @@
 #include <optional>
 #include <limits.h>
 #include <cstdint>
+#include <type_traits>
 
 namespace chargelab::string {
     namespace detail {
@@ -134,6 +135,61 @@ namespace chargelab::string {
     template <std::size_t N>
     inline std::string ToHexString(std::array<std::uint8_t, N> const& array, char const* separator = " ") {
         return ToHexString(array.data(), array.size(), separator);
+    }
+
+    enum class Endianness {
+        kLittle,
+        kBig,
+    };
+
+    // Interprets [begin, end) as a native-endian (Endianness::kLittle on ESP32/x86) byte buffer and
+    // formats it as hex, reversing the byte order first if the requested endianness doesn't match.
+    inline std::string ToHexString(
+            std::uint8_t const* begin,
+            std::uint8_t const* end,
+            Endianness endianness,
+            char const* separator = " ")
+    {
+        if (endianness == Endianness::kLittle) {
+            return ToHexString(begin, end, separator);
+        }
+
+        std::string result;
+        char const* ifs = "";
+        for (auto it = end; it != begin;) {
+            auto const byte = *(--it);
+            result += ifs;
+            result += detail::kHexCharacters[byte >> 4];
+            result += detail::kHexCharacters[byte & 0xF];
+            ifs = separator;
+        }
+
+        return result;
+    }
+
+    inline std::string ToHexString(
+            std::uint8_t const* begin,
+            std::size_t length,
+            Endianness endianness,
+            char const* separator = " ")
+    {
+        return ToHexString(begin, begin+length, endianness, separator);
+    }
+
+    template <std::size_t N>
+    inline std::string ToHexString(std::array<std::uint8_t, N> const& array, Endianness endianness, char const* separator = " ") {
+        return ToHexString(array.data(), array.size(), endianness, separator);
+    }
+
+    template <typename T, typename = std::enable_if_t<std::is_integral<T>::value>>
+    inline std::string ToHexString(T value, Endianness endianness, char const* separator = "") {
+        std::array<std::uint8_t, sizeof(T)> bytes {};
+        for (std::size_t i = 0; i < sizeof(T); i++) {
+            bytes[i] = static_cast<std::uint8_t>((static_cast<std::make_unsigned_t<T>>(value) >> (i * CHAR_BIT)) & 0xFF);
+        }
+
+        // bytes[] is now little-endian (bytes[0] = LSB); ToHexString(buffer, endianness) reorders as needed.
+        return ToHexString(bytes.data(), bytes.size(), endianness, separator);
     }
 
     template <typename F>
