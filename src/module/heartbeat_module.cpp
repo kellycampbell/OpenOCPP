@@ -4,10 +4,12 @@ namespace chargelab {
 
 HeartbeatModule::HeartbeatModule(
         std::shared_ptr<Settings> settings,
-        std::shared_ptr<SystemInterface> const& system_interface
+        std::shared_ptr<SystemInterface> const& system_interface,
+        std::shared_ptr<BootNotificationModule> boot_notification_module
 )
     : settings_(std::move(settings)),
       system_interface_(system_interface),
+      boot_notification_module_(std::move(boot_notification_module)),
       pending_heartbeat_req_ {system_interface}
 {
 }
@@ -17,6 +19,24 @@ HeartbeatModule::~HeartbeatModule() {
 }
 
 void HeartbeatModule::runStep(ocpp1_6::OcppRemote &remote) {
+    // Don't spontaneously send heartbeats before BootNotification has completed - the CSMS just
+    // heard from us via BootNotification (and will again via the connectors' initial
+    // StatusNotification), so an immediate Heartbeat on top of those is redundant traffic. A
+    // TriggerMessage-forced heartbeat is still honoured; boot_notification_module_ already
+    // rejects those before registration completes.
+    if (!boot_notification_synced_) {
+        if (!boot_notification_module_->registrationComplete()) {
+            if (!force_heartbeat_)
+                return;
+        } else {
+            // Registration just completed - start the idle timer now (rather than leaving it at
+            // its "infinitely idle" construction-time state) so the first heartbeat waits a full
+            // HeartbeatInterval instead of firing immediately.
+            pending_heartbeat_req_ = kNoOperation;
+            boot_notification_synced_ = true;
+        }
+    }
+
     if (!pending_heartbeat_req_.wasIdleFor(settings_->HeartbeatInterval.getValue())) {
         if (!force_heartbeat_ || pending_heartbeat_req_.operationInProgress())
             return;
@@ -53,6 +73,18 @@ void HeartbeatModule::onHeartbeatRsp(
 }
 
 void HeartbeatModule::runStep(ocpp2_0::OcppRemote &remote) {
+    // See the OCPP 1.6 runStep() above for why registration completion gates this and resets
+    // the idle timer.
+    if (!boot_notification_synced_) {
+        if (!boot_notification_module_->registrationComplete()) {
+            if (!force_heartbeat_)
+                return;
+        } else {
+            pending_heartbeat_req_ = kNoOperation;
+            boot_notification_synced_ = true;
+        }
+    }
+
     if (!pending_heartbeat_req_.wasIdleFor(settings_->HeartbeatInterval.getValue())) {
         if (!force_heartbeat_ || pending_heartbeat_req_.operationInProgress())
             return;

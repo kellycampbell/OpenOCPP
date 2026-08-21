@@ -83,7 +83,7 @@ namespace chargelab {
 
             get_logs_module = std::make_shared<GetLogsModule>(notNull(platform), notNull(pending_messages_module));
             boot_notification_module = std::make_shared<BootNotificationModule>(notNull(settings), notNull(platform));
-            heartbeat_module = std::make_shared<HeartbeatModule>(notNull(settings), notNull(platform));
+            heartbeat_module = std::make_shared<HeartbeatModule>(notNull(settings), notNull(platform), notNull(boot_notification_module));
             configuration_module = std::make_shared<ConfigurationModule>(notNull(settings), notNull(platform));
             fallback_module = std::make_shared<FallbackModule>(notNull(platform));
             reset_module = std::make_shared<ResetModule>(notNull(settings), notNull(platform), notNull(connector_status_module));

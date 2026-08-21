@@ -2,6 +2,7 @@
 #define CHARGELAB_OPEN_FIRMWARE_HEARTBEAT_MODULE_H
 
 #include "openocpp/module/common_templates.h"
+#include "openocpp/module/boot_notification_module.h"
 #include "openocpp/interface/component/system_interface.h"
 #include "openocpp/common/operation_holder.h"
 #include "openocpp/common/settings.h"
@@ -13,7 +14,8 @@ namespace chargelab {
     public:
         HeartbeatModule(
                 std::shared_ptr<Settings> settings,
-                std::shared_ptr<SystemInterface> const& system_interface
+                std::shared_ptr<SystemInterface> const& system_interface,
+                std::shared_ptr<BootNotificationModule> boot_notification_module
         );
 
         ~HeartbeatModule() override;
@@ -42,8 +44,12 @@ namespace chargelab {
     private:
         std::shared_ptr<Settings> settings_;
         std::shared_ptr<SystemInterface> system_interface_;
+        std::shared_ptr<BootNotificationModule> boot_notification_module_;
         OperationHolder<std::string> pending_heartbeat_req_;
         bool force_heartbeat_ = false;
+        // Set once, the first time registrationComplete() is observed true, so the idle timer
+        // below can be started from that point rather than from construction.
+        bool boot_notification_synced_ = false;
     };
 }
 
