@@ -223,8 +223,8 @@ void TransactionModule2_0::runStep(ocpp2_0::OcppRemote& remote) {
                         PendingMessagePolicy {
                                 PendingMessageType::kNotificationEvent,
                                 kMeterValuesGroupId,
-                                settings_->TransactionMessageAttempts.getValue(),
-                                settings_->TransactionMessageRetryInterval.getValue(),
+                                settings_->NotificationMessageDefaultRetries.getValue(),
+                                settings_->NotificationMessageDefaultRetryInterval.getValue(),
                                 kPriorityMeterValuesNotification,
                                 false,
                                 true
@@ -495,7 +495,66 @@ TransactionModule2_0::onRequestStopTransactionReq(const ocpp2_0::RequestStopTran
 std::optional<ocpp2_0::ResponseToRequest<ocpp2_0::TriggerMessageResponse>>
 TransactionModule2_0::onTriggerMessageReq(const ocpp2_0::TriggerMessageRequest &req) {
     if (req.requestedMessage == ocpp2_0::MessageTriggerEnumType::kMeterValues) {
-        return ocpp2_0::TriggerMessageResponse {ocpp2_0::TriggerMessageStatusEnumType::kRejected};
+        auto const& metadata = station_->getConnectorMetadata();
+
+        // F06.FR.11 - if evse is absent, treat it as "for all allowed evse values"; since this
+        // implementation only supports a single EVSE, that means defaulting to it
+        std::optional<ocpp2_0::EVSEType> evse = req.evse;
+        if (!evse.has_value()) {
+            if (metadata.empty()) {
+                return ocpp2_0::TriggerMessageResponse {ocpp2_0::TriggerMessageStatusEnumType::kRejected};
+            }
+
+            evse = metadata.begin()->first;
+        }
+
+        bool found = false;
+        for (auto const& x : metadata) {
+            if (x.first.id != evse->id) {
+                continue;
+            }
+            if (evse->connectorId.has_value() && evse->connectorId != x.first.connectorId) {
+                continue;
+            }
+
+            found = true;
+            break;
+        }
+
+        if (!found) {
+            return ocpp2_0::TriggerMessageResponse {ocpp2_0::TriggerMessageStatusEnumType::kRejected};
+        }
+
+        // F06.FR.06 - MeterValues trigger always reports via a stand-alone MeterValuesRequest, regardless of
+        // whether the EVSE is part of an ongoing transaction
+        auto const now = platform_->systemClockNow();
+        auto meter_values = getMeterValues(
+                evse,
+                ocpp2_0::ReadingContextEnumType::kTrigger,
+                settings_->MeterValuesAlignedData.getValue(),
+                now
+        );
+        if (!meter_values.filtered.has_value()) {
+            return ocpp2_0::TriggerMessageResponse {ocpp2_0::TriggerMessageStatusEnumType::kRejected};
+        }
+
+        pending_messages_module_->sendRequest2_0(
+                ocpp2_0::MeterValuesRequest {
+                        evse->id,
+                        std::move(meter_values.filtered.value())
+                },
+                PendingMessagePolicy {
+                        PendingMessageType::kNotificationEvent,
+                        kMeterValuesGroupId,
+                        settings_->NotificationMessageDefaultRetries.getValue(),
+                        settings_->NotificationMessageDefaultRetryInterval.getValue(),
+                        kPriorityMeterValuesNotification,
+                        false,
+                        true
+                }
+        );
+
+        return ocpp2_0::TriggerMessageResponse {ocpp2_0::TriggerMessageStatusEnumType::kAccepted};
     } else if (req.requestedMessage == ocpp2_0::MessageTriggerEnumType::kTransactionEvent) {
         for (auto& entry : active_transactions_) {
             if (!entry.first.has_value() || !entry.second.has_value())
