@@ -6,6 +6,7 @@
 #include "openocpp/protocol/ocpp1_6/types/sampled_value.h"
 #include "openocpp/protocol/ocpp1_6/types/charging_schedule_period.h"
 #include "openocpp/protocol/ocpp1_6/messages/set_charging_profile.h"
+#include "openocpp/protocol/ocpp2_0/types/reason_enum_type.h"
 #include "openocpp/protocol/ocpp2_0/types/sampled_value_type.h"
 #include "openocpp/protocol/ocpp2_0/types/evse_type.h"
 #include "openocpp/protocol/ocpp2_0/messages/set_charging_profile.h"
@@ -28,8 +29,11 @@ namespace chargelab {
         };
 
         struct FaultedStatus2_0 {
-            // TODO
-            CHARGELAB_JSON_INTRUSIVE_EMPTY(FaultedStatus2_0)
+            // Cause of the fault, reported as a TransactionEvent stoppedReason if the fault interrupts
+            // an in-progress transaction (e.g. GroundFault, OvercurrentFault, PowerQuality). Left unset
+            // falls back to a generic reason (StoppedByEV) when a transaction has to be stopped.
+            std::optional<ocpp2_0::ReasonEnumType> reason;
+            CHARGELAB_JSON_INTRUSIVE(FaultedStatus2_0, reason)
         };
 
         struct FaultedStatus {

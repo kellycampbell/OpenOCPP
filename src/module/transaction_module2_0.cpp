@@ -1210,11 +1210,17 @@ void TransactionModule2_0::processChargingEnabledStateChanged(ocpp2_0::EVSEType 
         if (!status.has_value() || !status->vehicle_connected)
             return;
 
+        // A fault (ground fault, over-current, etc.) cutting power off mid-session is not the EV
+        // stopping the charge - report the actual fault reason when the station has one available.
+        auto stopped_reason = ocpp2_0::ReasonEnumType::kStoppedByEV;
+        if (status->faulted_status.has_value() && status->faulted_status->status2_0.reason.has_value())
+            stopped_reason = status->faulted_status->status2_0.reason.value();
+
         CHARGELAB_LOG_MESSAGE(info) << "Stopping transaction (EnergyTransfer stopped) - transaction ID: " << active_transactions_[evse]->transaction_id;
         stopTransaction(
                 evse,
                 ocpp2_0::TriggerReasonEnumType::kChargingStateChanged,
-                ocpp2_0::ReasonEnumType::kStoppedByEV,
+                stopped_reason,
                 std::nullopt
         );
     }
