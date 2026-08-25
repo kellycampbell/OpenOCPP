@@ -23,15 +23,11 @@ namespace chargelab {
         }
 
         std::string getActiveSlotId() override {
-            std::array<uint8_t, sizeof(uint32_t)> buffer {};
-            std::memcpy(buffer.data(), &running_partition_->address, buffer.size());
-            return string::ToHexString(buffer, chargelab::string::Endianness::kLittle, "");
+            return running_partition_->label;
         }
 
         std::string getUpdateSlotId() override {
-            std::array<uint8_t, sizeof(uint32_t)> buffer {};
-            std::memcpy(buffer.data(), &update_partition_->address, buffer.size());
-            return string::ToHexString(buffer, chargelab::string::Endianness::kLittle, "");
+            return update_partition_->label;
         }
 
         Result startUpdateProcess(std::size_t update_size) override {
