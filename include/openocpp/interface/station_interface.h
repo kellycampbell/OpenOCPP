@@ -174,6 +174,16 @@ namespace chargelab {
         virtual std::vector<charger::TemperatureReading> getTemperatures() { return {}; }
 
         /**
+         * Whether a firmware update (of any component the vendor considers relevant, e.g. a
+         * subordinate controller reachable only from this station) is currently in progress.
+         * Consulted by ResetModule to refuse a Reset.req while true, since rebooting mid-update
+         * would interrupt it. Default is false, i.e. resets are never refused on this basis.
+         *
+         * @return true if a firmware update is in progress
+         */
+        virtual bool isFirmwareUpdateInProgress() { return false; }
+
+        /**
          * Enables/disables charging on a particular connector.
          *
          * @param evse

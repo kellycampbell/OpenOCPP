@@ -5,11 +5,13 @@ namespace chargelab {
 ResetModule::ResetModule(
         std::shared_ptr<Settings> settings,
         std::shared_ptr<SystemInterface> system,
-        std::shared_ptr<ConnectorStatusModule> connector_status_module
+        std::shared_ptr<ConnectorStatusModule> connector_status_module,
+        std::shared_ptr<StationInterface> station
 )
         : settings_(std::move(settings)),
           system_(std::move(system)),
-          connector_status_module_(std::move(connector_status_module))
+          connector_status_module_(std::move(connector_status_module)),
+          station_(std::move(station))
 {
 }
 
@@ -49,6 +51,16 @@ ResetModule::onResetReq(const ocpp2_0::ResetRequest &req) {
     // B11.FR.09
     if (req.evseId.has_value()) {
         return ocpp2_0::ResetResponse {ocpp2_0::ResetStatusEnumType::kRejected};
+    }
+
+    // Refuse to schedule a reset while a firmware update is in progress - the reboot would
+    // interrupt it (e.g. mid-flash on a subordinate controller, or a torn-down OTA write).
+    if (station_->isFirmwareUpdateInProgress()) {
+        CHARGELAB_LOG_MESSAGE(warning) << "Rejecting reset request - firmware update in progress";
+        return ocpp2_0::ResetResponse {
+            ocpp2_0::ResetStatusEnumType::kRejected,
+            ocpp2_0::StatusInfoType {"FwUpdateInProgress"}
+        };
     }
 
     switch (req.type) {
@@ -91,6 +103,13 @@ ResetModule::onResetReq(const ocpp2_0::ResetRequest &req) {
 
 std::optional<ocpp1_6::ResponseToRequest<ocpp1_6::ResetRsp>>
 ResetModule::onResetReq(const ocpp1_6::ResetReq &req) {
+    // Refuse to schedule a reset while a firmware update is in progress - the reboot would
+    // interrupt it (e.g. mid-flash on a subordinate controller, or a torn-down OTA write).
+    if (station_->isFirmwareUpdateInProgress()) {
+        CHARGELAB_LOG_MESSAGE(warning) << "Rejecting reset request - firmware update in progress";
+        return ocpp1_6::ResetRsp {ocpp1_6::ResetStatus::kRejected};
+    }
+
     switch (req.type) {
         case ocpp1_6::ResetType::kValueNotFoundInEnum:
             CHARGELAB_LOG_MESSAGE(warning) << "Invalid reset request type - treating as Soft";

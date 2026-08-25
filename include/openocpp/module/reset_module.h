@@ -4,6 +4,7 @@
 #include "openocpp/module/common_templates.h"
 #include "openocpp/module/connector_status_module.h"
 #include "openocpp/interface/component/system_interface.h"
+#include "openocpp/interface/station_interface.h"
 #include "openocpp/common/settings.h"
 
 namespace chargelab {
@@ -15,7 +16,8 @@ namespace chargelab {
         ResetModule(
                 std::shared_ptr<Settings> settings,
                 std::shared_ptr<SystemInterface> system,
-                std::shared_ptr<ConnectorStatusModule> connector_status_module
+                std::shared_ptr<ConnectorStatusModule> connector_status_module,
+                std::shared_ptr<StationInterface> station
         );
 
         ~ResetModule() override;
@@ -54,6 +56,7 @@ namespace chargelab {
         std::shared_ptr<Settings> settings_;
         std::shared_ptr<SystemInterface> system_;
         std::shared_ptr<ConnectorStatusModule> connector_status_module_;
+        std::shared_ptr<StationInterface> station_;
 
         std::optional<SteadyPointMillis> hard_reset_threshold_ = std::nullopt;
         std::optional<SteadyPointMillis> soft_reset_threshold_ = std::nullopt;
