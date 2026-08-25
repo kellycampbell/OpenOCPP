@@ -278,6 +278,21 @@ namespace chargelab {
         virtual std::string getActiveSlotId() = 0;
 
         /**
+         * Compares a slot ID (e.g. previously persisted as the expected update slot) against a reference slot ID
+         * (e.g. the current active slot) to determine whether they refer to the same slot. Defaults to a plain
+         * string comparison; stations whose slot ID representation has changed over time (e.g. a persisted value
+         * written by older firmware in a different format than getActiveSlotId()/getUpdateSlotId() now use) should
+         * override this to tolerate both formats.
+         *
+         * @param slot_id
+         * @param reference_slot_id
+         * @return true if slot_id and reference_slot_id refer to the same slot
+         */
+        virtual bool slotIdsMatch(std::string const& slot_id, std::string const& reference_slot_id) {
+            return slot_id == reference_slot_id;
+        }
+
+        /**
          * Starts a firmware update operation. Must be paired with a terminating finishUpdateProcess call on success or
          * failure.
          *

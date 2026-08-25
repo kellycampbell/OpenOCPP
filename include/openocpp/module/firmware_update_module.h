@@ -503,16 +503,17 @@ namespace chargelab {
                 std::string slot_id;
 
                 parseExpectedUpdateFirmwareSlotId(update, request_id, slot_id);
+                auto const matched = station_->slotIdsMatch(slot_id, active);
 
                 station_->notifyUpdateStatus(
-                        slot_id == active ? "Installed" : "InstallationFailed",
-                        slot_id == active ? "" : "booted slot " + active + ", expected " + slot_id,
-                        slot_id != active
+                        matched ? "Installed" : "InstallationFailed",
+                        matched ? "" : "booted slot " + active + ", expected " + slot_id,
+                        !matched
                 );
 
                 pending_messages_->sendRequest2_0(
                         ocpp2_0::FirmwareStatusNotificationRequest {
-                                slot_id == active ?
+                                matched ?
                                 ocpp2_0::FirmwareStatusEnumType::kInstalled :
                                 ocpp2_0::FirmwareStatusEnumType::kInstallationFailed,
                                 request_id
@@ -834,16 +835,17 @@ namespace chargelab {
                 std::string slot_id;
 
                 parseExpectedUpdateFirmwareSlotId(update, request_id, slot_id);
+                auto const matched = station_->slotIdsMatch(slot_id, active);
 
                 station_->notifyUpdateStatus(
-                        slot_id == active ? "Installed" : "InstallationFailed",
-                        slot_id == active ? "" : "booted slot " + active + ", expected " + slot_id,
-                        slot_id != active
+                        matched ? "Installed" : "InstallationFailed",
+                        matched ? "" : "booted slot " + active + ", expected " + slot_id,
+                        !matched
                 );
 
                 pending_messages_->sendRequest1_6(
                         ocpp1_6::FirmwareStatusNotificationReq {
-                                slot_id == active ?
+                                matched ?
                                 ocpp1_6::FirmwareStatus::kInstalled :
                                 ocpp1_6::FirmwareStatus::kInstallationFailed
                         },

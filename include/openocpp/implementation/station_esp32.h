@@ -30,6 +30,16 @@ namespace chargelab {
             return update_partition_->label;
         }
 
+        // Slot IDs used to be encoded as a hex partition address rather than the partition
+        // label; a slot ID persisted by older firmware may still be in that format. Accept
+        // either representation when comparing against the (now label-based) current slots.
+        bool slotIdsMatch(std::string const& slot_id, std::string const& reference_slot_id) override {
+            if (slot_id == reference_slot_id)
+                return true;
+
+            return normalizeSlotId(slot_id) == normalizeSlotId(reference_slot_id);
+        }
+
         Result startUpdateProcess(std::size_t update_size) override {
             if (update_handle_ != 0) {
                 CHARGELAB_LOG_MESSAGE(error) << "Another firmware update operation was in progress";
@@ -93,6 +103,23 @@ namespace chargelab {
         }
 
     private:
+        // Maps a slot ID - whether the current label format or the legacy hex address format -
+        // to its partition label, so both representations of the same partition normalize
+        // to the same value. Returns the input unchanged if it doesn't match a known partition.
+        std::string normalizeSlotId(std::string const& slot_id) const {
+            for (auto const* partition : {running_partition_, update_partition_}) {
+                if (slot_id == partition->label)
+                    return partition->label;
+
+                std::array<uint8_t, sizeof(uint32_t)> buffer {};
+                std::memcpy(buffer.data(), &partition->address, buffer.size());
+                if (slot_id == string::ToHexString(buffer, chargelab::string::Endianness::kLittle, ""))
+                    return partition->label;
+            }
+
+            return slot_id;
+        }
+
         esp_partition_t const* running_partition_;
         esp_partition_t const* update_partition_;
 
