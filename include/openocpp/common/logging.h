@@ -29,6 +29,9 @@ namespace chargelab::logging {
         int line;
 #endif
         std::string_view function;
+        // Empty for the OCPP stack's own messages. Set to the ESP-IDF log tag for ESP_LOGW/ESP_LOGE
+        // lines forwarded from other components (see esp_log_forwarder.h).
+        std::string_view component {};
     };
 
     void SetLogLevel(LogLevel level);

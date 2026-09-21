@@ -20,19 +20,30 @@ GetLogsModule::GetLogsModule(
     // flushLogMessages on the OCPP task. It must not allocate and must not block: log_buffer_ takes
     // fixed-size, trivially copyable entries for exactly that reason.
     listener_ = std::make_shared<logging::LoggingListenerFunction>([&](logging::LogMetadata const& metadata, std::string_view const& message) {
-        std::string_view prefix {};
-#if defined(LOG_WITH_FILE_AND_LINE)
         // Note: rendered into a stack buffer rather than a std::string to keep this path allocation free.
         char prefix_buffer[64];
+        std::size_t prefix_length = 0;
+        auto const appendPrefix = [&](int written) {
+            if (written > 0) {
+                prefix_length = std::min(prefix_length + (std::size_t)written, sizeof(prefix_buffer) - 1);
+            }
+        };
+#if defined(LOG_WITH_FILE_AND_LINE)
         // Note: metadata.file is a string_view and is not guaranteed to be null terminated.
-        auto const written = std::snprintf(
+        appendPrefix(std::snprintf(
                 prefix_buffer, sizeof(prefix_buffer), "[%.*s:%d]",
                 (int)metadata.file.size(), metadata.file.data(), metadata.line
-        );
-        if (written > 0) {
-            prefix = std::string_view {prefix_buffer, std::min((std::size_t)written, sizeof(prefix_buffer) - 1)};
-        }
+        ));
 #endif
+        // Note: lines forwarded from other ESP-IDF components carry their log tag as the component,
+        // which is the only way to tell them apart from the OCPP stack's own lines in the upload.
+        if (!metadata.component.empty() && prefix_length < sizeof(prefix_buffer) - 1) {
+            appendPrefix(std::snprintf(
+                    prefix_buffer + prefix_length, sizeof(prefix_buffer) - prefix_length, "[%.*s] ",
+                    (int)metadata.component.size(), metadata.component.data()
+            ));
+        }
+        std::string_view const prefix {prefix_buffer, prefix_length};
 
         log_buffer_.pushBack(
                 index_++,
